@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "sextant_extension.hpp"
+#include "sextant_index.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -11,8 +12,7 @@
 
 namespace duckdb {
 
-// Smoke: proves the C seam is linked and callable. Prints the ABI-facing
-// version of the opened engine build (no index needed).
+// Smoke: proves the C seam is linked and callable.
 inline void SextantVersionFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &name_vector = args.data[0];
 	UnaryExecutor::Execute<string_t, string_t>(name_vector, result, args.size(), [&](string_t name) {
@@ -24,9 +24,10 @@ inline void SextantVersionFun(DataChunk &args, ExpressionState &state, Vector &r
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	auto sextant_version_function =
-	    ScalarFunction("sextant_version", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SextantVersionFun);
-	loader.RegisterFunction(sextant_version_function);
+	loader.RegisterFunction(
+	    ScalarFunction("sextant_version", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SextantVersionFun));
+	RegisterSextantIndexType(loader.GetDatabaseInstance());
+	RegisterSextantImmutabilityOptimizer(loader.GetDatabaseInstance());
 }
 
 void SextantExtension::Load(ExtensionLoader &loader) {

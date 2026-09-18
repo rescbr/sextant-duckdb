@@ -1,0 +1,76 @@
+# name: test/sql/sextant_lifecycle.test
+# description: sextant index lifecycle — create, immutability fence, persistence, drop
+# group: [sql]
+
+require sextant
+
+# Persistent database so `restart` reopens the same file.
+load __TEST_DIR__/sextant_lifecycle.db
+
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(32), j -> ((rowid*32+j)%97)::FLOAT)::FLOAT[32] AS v FROM range(2000) tbl(rowid)
+
+# Missing path option
+statement error
+CREATE INDEX bad ON t USING sextant (v)
+----
+Binder Error
+
+# Unknown option
+statement error
+CREATE INDEX bad ON t USING sextant (v) WITH (path = '__WORKING_DIRECTORY__/test/data/small.tree', frobnicate = 1)
+----
+Binder Error
+
+# Create with absolute sidecar path
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = '__WORKING_DIRECTORY__/test/data/small.tree')
+
+# INSERT aborts cleanly at commit; table unchanged
+statement error
+INSERT INTO t SELECT list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32] FROM range(1)
+----
+Immutable sextant index: INSERT
+
+query I
+SELECT count(*) FROM t
+----
+2000
+
+# DELETE / UPDATE rejected at plan time
+statement error
+DELETE FROM t WHERE rowid < 5
+----
+Immutable sextant index: DELETE
+
+statement error
+UPDATE t SET v = v WHERE rowid = 0
+----
+Immutable sextant index: UPDATE
+
+query I
+SELECT count(*) FROM t
+----
+2000
+
+# Persistence: checkpoint + restart, index survives
+statement ok
+CHECKPOINT
+
+restart
+
+require sextant
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx'
+----
+1
+
+statement error
+INSERT INTO t SELECT list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32] FROM range(1)
+----
+Immutable sextant index: INSERT
+
+# DROP INDEX (sidecar deletion), uuid-mismatch and missing-sidecar error
+# paths are covered by test/run_lifecycle_demo.sh (they are destructive to
+# the fixture / need file manipulation).
