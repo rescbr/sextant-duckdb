@@ -234,6 +234,7 @@ struct SextantBindData : public IndexBuildBindData {
 	vector<string> filter_cols; // WITH (filter_cols = [...]): table columns
 	string payload_col;         // WITH (payload_col = '...'): blob column
 	int64_t build_threads = 0;  // WITH (build_threads = N): engine build threads
+	int64_t staging_bytes = 0;   // WITH (staging_bytes = N): push-staging RAM budget
 };
 
 struct SextantGlobalState : public IndexBuildGlobalState {
@@ -259,7 +260,7 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 
 	// Validate options strictly.
 		static const char *const kKnown[] = {"path", "delta_scan", "prebuilt", "filter_cols", "payload_col",
-		                                "build_threads"};
+		                                "build_threads", "staging_bytes"};
 	for (const auto &opt : info.options) {
 		bool known = false;
 		for (auto *k : kKnown) {
@@ -311,6 +312,12 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 		bind->build_threads = bt->second.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 		if (bind->build_threads < 0 || bind->build_threads > 1024) {
 			throw BinderException("sextant build_threads must be in [0, 1024]");
+		}
+	}
+	if (auto sb = info.options.find("staging_bytes"); sb != info.options.end()) {
+		bind->staging_bytes = sb->second.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+		if (bind->staging_bytes < 0) {
+			throw BinderException("sextant staging_bytes must be >= 0");
 		}
 	}
 	return std::move(bind);
@@ -384,6 +391,7 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 		if (bind.build_threads > 0) {
 			opts.num_threads = static_cast<uint32_t>(bind.build_threads);
 		}
+		opts.staging_bytes = static_cast<uint64_t>(bind.staging_bytes);
 		char err[512] = {0};
 		state->builder = sextant_build_begin(
 		    &opts, state->dim, defs.empty() ? nullptr : defs.data(),
@@ -811,7 +819,18 @@ void RegisterSextantIndexType(DatabaseInstance &db) {
 		                                     input.table_io_manager, input.unbound_expressions, input.db,
 		                                     input.options, input.storage_info, 0);
 		if (input.storage_info.IsValid() && !index->GetSidecarPath().empty()) {
-			index->AttachAndVerify();
+			// Tolerate dead sidecars at LOAD time (deleted file, moved
+			// directory, mismatched tree): throwing here wedges every
+			// statement that binds the table catalog — including DROP
+			// INDEX of the broken entry itself, the only way to clean it
+			// up. Defer the failure to actual use (scan bind re-verifies
+			// via AttachAndVerify and reports the precise error).
+			try {
+				index->AttachAndVerify();
+			} catch (const std::exception &e) {
+				index->sidecar_unusable = true;
+				index->sidecar_error = e.what();
+			}
 		}
 		return std::move(index);
 	};

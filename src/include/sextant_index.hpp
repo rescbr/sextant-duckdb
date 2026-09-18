@@ -78,6 +78,16 @@ public:
 	const string &GetSidecarPath() const {
 		return sidecar_path;
 	}
+
+	/// Set when the sidecar could not be opened at catalog-load time
+	/// (deleted file, moved directory, mismatched tree UUID). The entry
+	/// stays droppable and other DDL on the table stays possible; only
+	/// operations that actually USE this index re-verify (scan bind calls
+	/// AttachAndVerify) and fail with the precise error.
+	/// Written by the load path (create_instance) only.
+	bool sidecar_unusable = false;
+	string sidecar_error;
+
 	/// Cached engine handle (null until attached).
 	void *GetEngineHandle() const {
 		return engine_handle;
