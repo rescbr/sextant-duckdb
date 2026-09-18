@@ -32,9 +32,16 @@ public:
 	IndexStorageInfo SerializeToWAL(const case_insensitive_map_t<Value> &options) override;
 	void ResetStorage(IndexLock &index_lock) override;
 
-	/// Open the sidecar read-only and verify its UUID (adopt on first
-	/// attach; hard error on mismatch).
+	/// Open the sidecar read-only, verify its UUID (adopt on first attach;
+	/// hard error on mismatch) and cache the handle for the index lifetime.
 	void AttachAndVerify();
+
+	/// Release the cached engine handle (idempotent).
+	void CloseHandle();
+
+	/// Cached sextant engine handle (one per index entry; searches on it
+	/// are thread-safe). Null until first successful attach.
+	void *engine_handle = nullptr;
 
 	// --- maintenance: refuse everything ---
 	ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;

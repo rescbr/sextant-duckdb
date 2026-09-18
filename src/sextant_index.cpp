@@ -2,6 +2,8 @@
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/index/index_type.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -155,7 +157,16 @@ SextantIndex::SextantIndex(const string &name, IndexConstraintType index_constra
 
 SextantIndex::~SextantIndex() {
 	// Sidecar deletion happens in ResetStorage (committed DROP vs checkpoint
-	// rebuild) — NOT here: destructors also run on database close.
+	// rebuild) — NOT here: destructors also run on database close. The
+	// engine handle, however, is ours to release on any teardown.
+	CloseHandle();
+}
+
+void SextantIndex::CloseHandle() {
+	if (engine_handle) {
+		sextant_close_index(engine_handle);
+		engine_handle = nullptr;
+	}
 }
 
 string SextantIndex::ResolveSidecarPath(AttachedDatabase &db, const string &path) {
@@ -177,9 +188,12 @@ string SextantIndex::ResolveSidecarPath(AttachedDatabase &db, const string &path
 }
 
 void SextantIndex::AttachAndVerify() {
-	// Open the sidecar read-only and verify its UUID against the one we
-	// recorded (stale/wrong-file detection). For the lifecycle spike the
-	// handle is not retained (scan support lands in step 2).
+	// Open the sidecar read-only, verify its UUID against the one we
+	// recorded (stale/wrong-file detection), and CACHE the handle for the
+	// index lifetime: one open handle per index entry, shared by all DuckDB
+	// scan threads (sextant_search is thread-safe on a handle — verified
+	// under TSAN by the engine's ConcurrentSearchStress test).
+	CloseHandle();
 	char err[512] = {0};
 	void *handle = sextant_open_index(sidecar_path.c_str(), err, sizeof(err));
 	if (!handle) {
@@ -195,7 +209,7 @@ void SextantIndex::AttachAndVerify() {
 		                            sidecar_path);
 	}
 	const string sidecar_uuid(uuid);
-	sextant_close_index(handle);
+	engine_handle = handle;  // kept open until CloseHandle()
 
 	if (tree_uuid.empty()) {
 		// First attach: adopt the sidecar's identity.
@@ -216,11 +230,17 @@ namespace {
 
 struct SextantBindData : public IndexBuildBindData {
 	string sidecar_path; // as-given WITH (path = ...) value
+	bool attach = false; // WITH (attach = true): sidecar exists, do not build
 };
 
 struct SextantGlobalState : public IndexBuildGlobalState {
 	unique_ptr<BoundIndex> global_index;
 	std::atomic<idx_t> n_rows {0};
+	// Build-from-table state (attach == false).
+	void *builder = nullptr;       // sextant builder handle
+	uint32_t dim = 0;              // vector dimension (ARRAY size)
+	mutex builder_mu;              // serializes sextant_build_push
+	char build_err[512] = {0};
 };
 
 struct SextantLocalState : public IndexBuildLocalState {
@@ -233,18 +253,30 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 	auto &info = input.info;
 
 	// Validate options strictly.
+	static const char *const kKnown[] = {"path", "delta_scan", "prebuilt"};
 	for (const auto &opt : info.options) {
-		if (opt.first != "path" && opt.first != "delta_scan") {
+		bool known = false;
+		for (auto *k : kKnown) {
+			if (StringUtil::CIEquals(opt.first, k)) {
+				known = true;
+				break;
+			}
+		}
+		if (!known) {
 			throw BinderException("Unknown option '%s' for sextant index", opt.first);
 		}
 	}
 	if (info.options.find("path") == info.options.end()) {
-		throw BinderException("Sextant indexes require WITH (path = '<tree file>') pointing at a built "
-		                      "sextant .tree sidecar");
+		throw BinderException("Sextant indexes require WITH (path = '<tree file>'): by default the tree is "
+		                      "BUILT from the table into that file; WITH (prebuilt = true) attaches an "
+		                      "existing prebuilt tree");
 	}
 
 	auto bind = make_uniq<SextantBindData>();
 	bind->sidecar_path = info.options.at("path").GetValue<string>();
+	if (auto prebuilt = info.options.find("prebuilt"); prebuilt != info.options.end()) {
+		bind->attach = prebuilt->second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+	}
 	return std::move(bind);
 }
 
@@ -256,6 +288,27 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 	                                              input.storage_ids, TableIOManager::Get(storage), input.expressions,
 	                                              storage.db, input.info.options, IndexStorageInfo(), 0);
 
+	if (input.bind_data && !input.bind_data->Cast<SextantBindData>().attach) {
+		// Build-from-table: start the streaming builder. Dimension comes
+		// from the single FLOAT[d] column (validated in the ctor).
+		auto &index = state->global_index->Cast<SextantIndex>();
+		auto &vec_type = index.logical_types[0];
+		state->dim = ArrayType::GetSize(vec_type);
+		auto &child_type = ArrayType::GetChildType(vec_type);
+		if (child_type != LogicalType::FLOAT) {
+			throw BinderException("Sextant indexes require a FLOAT[d] ARRAY column, got %s",
+			                      child_type.ToString());
+		}
+
+		sextant_build_opts opts = sextant_default_build_opts();
+		char err[512] = {0};
+		state->builder = sextant_build_begin(&opts, state->dim, nullptr, 0, 0, err, sizeof(err));
+		if (!state->builder) {
+			throw InvalidInputException("Sextant index '%s': cannot start build: %s",
+			                            index.GetIndexName(), err);
+		}
+	}
+
 	return std::move(state);
 }
 
@@ -264,11 +317,33 @@ unique_ptr<IndexBuildLocalState> SextantIndex::BuildLocalInit(IndexBuildInitLoca
 }
 
 void SextantIndex::BuildSink(IndexBuildSinkInput &input, DataChunk &key_chunk, DataChunk &row_chunk) {
-	// The sidecar is authoritative for vector data; we only record the
-	// table row count at index creation (n_build, the delta_scan split
-	// point later).
 	auto &lstate = input.local_state.Cast<SextantLocalState>();
 	lstate.n_rows += row_chunk.size();
+
+	auto &gstate = input.global_state.Cast<SextantGlobalState>();
+	if (!gstate.builder) {
+		return; // attach mode: the sidecar is authoritative, nothing to push
+	}
+
+	// Extract the contiguous FLOAT[d] values from the array column and
+	// push into the engine builder (serialized: the builder handle is not
+	// documented thread-safe; copy cost is negligible vs the build).
+	key_chunk.Flatten();
+	auto &vec_vec = key_chunk.data[0];
+	auto &child = const_cast<Vector &>(ArrayVector::GetEntry(vec_vec));
+	auto *data = FlatVector::GetData<float>(child);
+	const auto count = key_chunk.size();
+
+	lock_guard<mutex> lock(gstate.builder_mu);
+	char err[512] = {0};
+	if (sextant_build_push(gstate.builder, data, static_cast<uint32_t>(count), nullptr, nullptr, nullptr,
+	                       err, sizeof(err)) != 0) {
+		// Fatal for this create; the transaction aborts.
+		sextant_build_abort(gstate.builder);
+		gstate.builder = nullptr;
+		throw InvalidInputException("Sextant index: build push failed at row %llu: %s",
+		                            lstate.n_rows - count, err);
+	}
 }
 
 void SextantIndex::BuildCombine(IndexBuildCombineInput &input) {
@@ -281,6 +356,18 @@ void SextantIndex::BuildCombine(IndexBuildCombineInput &input) {
 unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &input) {
 	auto &gstate = input.global_state.Cast<SextantGlobalState>();
 	auto &index = gstate.global_index->Cast<SextantIndex>();
+
+	// Build-from-table: run the (blocking) engine build now.
+	if (gstate.builder) {
+		char err[512] = {0};
+		const string out_path = index.GetSidecarPath();
+		if (sextant_build_finish(gstate.builder, out_path.c_str(), err, sizeof(err)) != 0) {
+			// finish() frees the builder on failure too.
+			gstate.builder = nullptr;
+			throw InvalidInputException("Sextant index '%s': build failed: %s", index.GetIndexName(), err);
+		}
+		gstate.builder = nullptr;
+	}
 
 	// Record n_build and attach + verify the sidecar before the index
 	// becomes visible: a missing or wrong tree fails CREATE INDEX itself.
@@ -417,8 +504,9 @@ void SextantIndex::ResetStorage(IndexLock &index_lock) {
 		serialized_this_generation = false;
 	} else {
 		// Called from TableIndexList::RemoveIndex on a committed DROP:
-		// delete the sidecar (best-effort; crash-window orphans are
-		// documented).
+		// release the handle, then delete the sidecar (best-effort;
+		// crash-window orphans are documented).
+		CloseHandle();
 		std::error_code ec;
 		if (!sidecar_path.empty() && std::filesystem::exists(sidecar_path, ec)) {
 			std::filesystem::remove(sidecar_path, ec);

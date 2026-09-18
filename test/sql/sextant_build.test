@@ -1,0 +1,50 @@
+# name: test/sql/sextant_build.test
+# description: build-from-table — CREATE INDEX builds the sidecar from the table
+# group: [sql]
+
+require sextant
+
+load __TEST_DIR__/sextant_build.db
+
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(32), j -> ((rowid*32+j)%97)::FLOAT + rowid::FLOAT * 0.01)::FLOAT[32] AS v FROM range(2000) tbl(rowid)
+
+# Default: path is the BUILD TARGET — the tree is built from the table.
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'built.tree')
+
+# Table row count was recorded at build time; the sidecar exists and the
+# engine handle is attached (uuid adopted). Immutability fence still works.
+statement error
+INSERT INTO t SELECT list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32] FROM range(1)
+----
+Immutable sextant index: INSERT
+
+query I
+SELECT count(*) FROM t
+----
+2000
+
+statement ok
+CHECKPOINT
+
+restart
+
+require sextant
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx'
+----
+1
+
+statement error
+UPDATE t SET v = v WHERE rowid = 0
+----
+Immutable sextant index: UPDATE
+
+# Rebuilding to an existing path overwrites it (fresh uuid, no stale guard).
+statement ok
+DROP INDEX idx
+
+statement ok
+CREATE INDEX idx2 ON t USING sextant (v) WITH (path = 'built.tree')

@@ -57,6 +57,15 @@ void EnforceImmutable(ClientContext &context, LogicalOperator &op) {
 		} else {
 			table = &op.Cast<LogicalUpdate>().table;
 		}
+		if (table && table->IsDuckTable()) {
+			// Force-bind lazily-bound indexes first: after a restart the
+			// sextant index may still be unbound (binding normally happens
+			// only at first data modification — which our fence rejects).
+			auto &duck_table = table->Cast<DuckTableEntry>();
+			if (duck_table.GetStorage().GetDataTableInfo()->GetIndexes().HasUnbound()) {
+				duck_table.GetStorage().BindIndexes(context);
+			}
+		}
 		if (table && TableHasSextantIndex(*table)) {
 			throw InvalidInputException(
 			    "Immutable sextant index: %s is not supported on table '%s'. Drop and re-create the index "

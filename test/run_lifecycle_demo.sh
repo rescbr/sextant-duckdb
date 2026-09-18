@@ -19,7 +19,7 @@ echo "== create index (relative path, dbdir-resolved) + insert fence =="
 "$DUCKDB" "$WORK/db.duckdb" -c "
 LOAD sextant;
 CREATE TABLE t AS SELECT list_transform(range(32), j -> ((rowid*32+j)%97)::FLOAT)::FLOAT[32] AS v FROM range(2000) tbl(rowid);
-CREATE INDEX idx ON t USING sextant (v) WITH (path = 'small.tree');" >/dev/null 2>&1
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'small.tree', prebuilt);" >/dev/null 2>&1
 
 echo "== DROP INDEX deletes the sidecar =="
 "$DUCKDB" "$WORK/db.duckdb" -c "LOAD sextant; DROP INDEX idx;" >/dev/null 2>&1
@@ -31,7 +31,7 @@ N=$("$DUCKDB" "$WORK/db.duckdb" -noheader -list -c "LOAD sextant; SELECT count(*
 [ "$N" = "2000" ] && echo "OK: table intact ($N rows)" || { echo "FAIL: table broken ($N)"; exit 1; }
 
 echo "== uuid guard: stale tree at the path is rejected =="
-"$DUCKDB" "$WORK/db.duckdb" -c "LOAD sextant; CREATE INDEX idx ON t USING sextant (v) WITH (path = 'small.tree');" >/dev/null 2>&1
+"$DUCKDB" "$WORK/db.duckdb" -c "LOAD sextant; CREATE INDEX idx ON t USING sextant (v) WITH (path = 'small.tree', prebuilt);" >/dev/null 2>&1
 "$DUCKDB" "$WORK/db.duckdb" -c "LOAD sextant; CHECKPOINT;" >/dev/null 2>&1
 "$ENGINE" build-tree --input="${REPO}/test/data/small.fbin" --index="$WORK/other.tree" >/dev/null 2>&1
 cp "$WORK/other.tree" "$WORK/small.tree"

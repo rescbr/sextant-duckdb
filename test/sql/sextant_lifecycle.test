@@ -22,9 +22,9 @@ CREATE INDEX bad ON t USING sextant (v) WITH (path = '__WORKING_DIRECTORY__/test
 ----
 Binder Error
 
-# Create with absolute sidecar path
+# Create by ATTACHING the prebuilt fixture
 statement ok
-CREATE INDEX idx ON t USING sextant (v) WITH (path = '__WORKING_DIRECTORY__/test/data/small.tree')
+CREATE INDEX idx ON t USING sextant (v) WITH (path = '__WORKING_DIRECTORY__/test/data/small.tree', prebuilt)
 
 # INSERT aborts cleanly at commit; table unchanged
 statement error
