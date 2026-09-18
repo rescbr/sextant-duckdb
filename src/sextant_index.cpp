@@ -233,6 +233,7 @@ struct SextantBindData : public IndexBuildBindData {
 	bool attach = false; // WITH (prebuilt): sidecar exists, do not build
 	vector<string> filter_cols; // WITH (filter_cols = [...]): table columns
 	string payload_col;         // WITH (payload_col = '...'): blob column
+	int64_t build_threads = 0;  // WITH (build_threads = N): engine build threads
 };
 
 struct SextantGlobalState : public IndexBuildGlobalState {
@@ -257,7 +258,8 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 	auto &info = input.info;
 
 	// Validate options strictly.
-	static const char *const kKnown[] = {"path", "delta_scan", "prebuilt", "filter_cols", "payload_col"};
+		static const char *const kKnown[] = {"path", "delta_scan", "prebuilt", "filter_cols", "payload_col",
+		                                "build_threads"};
 	for (const auto &opt : info.options) {
 		bool known = false;
 		for (auto *k : kKnown) {
@@ -304,6 +306,12 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 	}
 	if (auto pc = info.options.find("payload_col"); pc != info.options.end()) {
 		bind->payload_col = pc->second.ToString();
+	}
+	if (auto bt = info.options.find("build_threads"); bt != info.options.end()) {
+		bind->build_threads = bt->second.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+		if (bind->build_threads < 0 || bind->build_threads > 1024) {
+			throw BinderException("sextant build_threads must be in [0, 1024]");
+		}
 	}
 	return std::move(bind);
 }
@@ -372,6 +380,9 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 		}
 
 		sextant_build_opts opts = sextant_default_build_opts();
+		if (bind.build_threads > 0) {
+			opts.num_threads = static_cast<uint32_t>(bind.build_threads);
+		}
 		char err[512] = {0};
 		state->builder = sextant_build_begin(
 		    &opts, state->dim, defs.empty() ? nullptr : defs.data(),
@@ -446,6 +457,14 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 			vector<sextant_str_values> str_bufs;
 			vector<vector<const char *>> str_ptrs;
 			vector<vector<uint32_t>> str_lens;
+			// Reserve: `filter_values` holds pointers INTO these outer
+			// vectors' storage — reallocation would dangle them.
+			i32_bufs.reserve(n_filters);
+			i64_bufs.reserve(n_filters);
+			f32_bufs.reserve(n_filters);
+			str_bufs.reserve(n_filters);
+			str_ptrs.reserve(n_filters);
+			str_lens.reserve(n_filters);
 			for (idx_t f = 0; f < n_filters; f++) {
 				auto &col = data.data[1 + f];
 				switch (gstate.filter_types[f]) {
