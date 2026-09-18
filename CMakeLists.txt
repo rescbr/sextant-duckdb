@@ -23,8 +23,37 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 set(SEXTANT_ENGINE_DIR "${CMAKE_CURRENT_LIST_DIR}/../sextant-engine" CACHE PATH "sextant-engine checkout")
 target_include_directories(${EXTENSION_NAME} PRIVATE "${SEXTANT_ENGINE_DIR}/include")
 target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE "${SEXTANT_ENGINE_DIR}/include")
-target_link_libraries(${EXTENSION_NAME} PRIVATE "${SEXTANT_ENGINE_DIR}/build-x86/libsextant_c.a" "${SEXTANT_ENGINE_DIR}/build-x86/libsextant.a")
-target_link_libraries(${LOADABLE_EXTENSION_NAME} PRIVATE "${SEXTANT_ENGINE_DIR}/build-x86/libsextant_c.a" "${SEXTANT_ENGINE_DIR}/build-x86/libsextant.a")
+# The engine's spdlog resolves via pkg-config (compiled shared lib on
+# Ubuntu; header-only subproject elsewhere). Mirror whatever pkg-config
+# says so the extension TUs see the same spdlog ABI as libsextant.a.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+	execute_process(COMMAND ${PKG_CONFIG_EXECUTABLE} --cflags spdlog
+		OUTPUT_VARIABLE SPDLOG_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE
+		RESULT_VARIABLE SPDLOG_RC)
+	execute_process(COMMAND ${PKG_CONFIG_EXECUTABLE} --libs spdlog
+		OUTPUT_VARIABLE SPDLOG_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE
+		RESULT_VARIABLE SPDLOG_RC2)
+endif()
+if(SPDLOG_RC EQUAL 0 AND SPDLOG_RC2 EQUAL 0)
+	separate_arguments(SPDLOG_CFLAGS)
+	separate_arguments(SPDLOG_LIBS)
+	target_compile_options(${EXTENSION_NAME} PRIVATE ${SPDLOG_CFLAGS})
+	target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE ${SPDLOG_CFLAGS})
+else()
+	set(SPDLOG_LIBS "")
+	message(STATUS "spdlog not found via pkg-config (header-only mode?)")
+endif()
+set(SEXTANT_LIBS
+	"${SEXTANT_ENGINE_DIR}/build-x86/libsextant_c.a"
+	"${SEXTANT_ENGINE_DIR}/build-x86/libsextant.a"
+	"${SEXTANT_ENGINE_DIR}/build-x86/libsextant_sources.a"
+	"${SEXTANT_ENGINE_DIR}/build-x86/subprojects/carquet/libcarquet.a"
+	"${SEXTANT_ENGINE_DIR}/build-x86/subprojects/nsync-5b420ef6b16532a4fad4be1fde8e483b6b7bd8f4/libnsync.a"
+	"${SEXTANT_ENGINE_DIR}/build-x86/subprojects/cpptrace-91b6b78e408a8b1c0b7146c9034a03156c082da2/libcpptrace.a"  # cpptrace-91b6b78e408a8b1c0b7146c9034a03156c082da2
+	${SPDLOG_LIBS})
+target_link_libraries(${EXTENSION_NAME} ${SEXTANT_LIBS})
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${SEXTANT_LIBS})
 
 install(
   TARGETS ${EXTENSION_NAME}
