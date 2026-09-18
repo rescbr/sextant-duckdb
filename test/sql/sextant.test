@@ -1,0 +1,18 @@
+# name: test/sql/sextant.test
+# description: test sextant extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT sextant_version('Sam');
+----
+Catalog Error: Scalar Function with name sextant_version does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require sextant
+
+# Confirm the C seam is linked and callable
+query I
+SELECT sextant_version('Sam') LIKE 'sextant (Sam)%';
+----
+true
