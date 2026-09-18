@@ -230,7 +230,9 @@ namespace {
 
 struct SextantBindData : public IndexBuildBindData {
 	string sidecar_path; // as-given WITH (path = ...) value
-	bool attach = false; // WITH (attach = true): sidecar exists, do not build
+	bool attach = false; // WITH (prebuilt): sidecar exists, do not build
+	vector<string> filter_cols; // WITH (filter_cols = [...]): table columns
+	string payload_col;         // WITH (payload_col = '...'): blob column
 };
 
 struct SextantGlobalState : public IndexBuildGlobalState {
@@ -239,8 +241,10 @@ struct SextantGlobalState : public IndexBuildGlobalState {
 	// Build-from-table state (attach == false).
 	void *builder = nullptr;       // sextant builder handle
 	uint32_t dim = 0;              // vector dimension (ARRAY size)
-	mutex builder_mu;              // serializes sextant_build_push
-	char build_err[512] = {0};
+	ClientContext *context = nullptr; // for the finalize scan
+	string scan_sql;               // SELECT vec, filters..., payload
+	vector<int> filter_types;      // SEXTANT_COL_* per declared filter col
+	bool has_payload = false;
 };
 
 struct SextantLocalState : public IndexBuildLocalState {
@@ -253,7 +257,7 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 	auto &info = input.info;
 
 	// Validate options strictly.
-	static const char *const kKnown[] = {"path", "delta_scan", "prebuilt"};
+	static const char *const kKnown[] = {"path", "delta_scan", "prebuilt", "filter_cols", "payload_col"};
 	for (const auto &opt : info.options) {
 		bool known = false;
 		for (auto *k : kKnown) {
@@ -277,6 +281,30 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 	if (auto prebuilt = info.options.find("prebuilt"); prebuilt != info.options.end()) {
 		bind->attach = prebuilt->second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 	}
+	if (auto fc = info.options.find("filter_cols"); fc != info.options.end()) {
+		// Comma-separated column names: 1.5.5's option parser rejects
+		// non-constant def-elems, and list literals do not fold to
+		// constants there.
+		const string spec = fc->second.ToString();
+		string cur;
+		for (const char ch : spec) {
+			if (ch == ',') {
+				bind->filter_cols.push_back(StringUtil::Replace(StringUtil::Replace(cur, " ", ""), "\t", ""));
+				cur.clear();
+			} else {
+				cur.push_back(ch);
+			}
+		}
+		if (cur.find_first_not_of(" \t") != std::string::npos) {
+			bind->filter_cols.push_back(StringUtil::Replace(StringUtil::Replace(cur, " ", ""), "\t", ""));
+		}
+		if (bind->filter_cols.empty()) {
+			throw BinderException("sextant filter_cols must be a comma-separated list of column names");
+		}
+	}
+	if (auto pc = info.options.find("payload_col"); pc != info.options.end()) {
+		bind->payload_col = pc->second.ToString();
+	}
 	return std::move(bind);
 }
 
@@ -289,8 +317,11 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 	                                              storage.db, input.info.options, IndexStorageInfo(), 0);
 
 	if (input.bind_data && !input.bind_data->Cast<SextantBindData>().attach) {
-		// Build-from-table: start the streaming builder. Dimension comes
-		// from the single FLOAT[d] column (validated in the ctor).
+		// Build-from-table: the generic plan's sink only receives the
+		// indexed column + rowid, so the vector+filter+payload stream is
+		// produced by OUR scan at finalize. Here: validate columns, declare
+		// the builder, and prepare the scan SQL.
+		auto &bind = input.bind_data->Cast<SextantBindData>();
 		auto &index = state->global_index->Cast<SextantIndex>();
 		auto &vec_type = index.logical_types[0];
 		state->dim = ArrayType::GetSize(vec_type);
@@ -300,13 +331,59 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 			                      child_type.ToString());
 		}
 
+		auto &duck_table = input.table;
+		auto quoted = [&](const string &s) { return "\"" + StringUtil::Replace(s, "\"", "\"\"") + "\""; };
+
+		// Vector column name (from the table's indexed storage column).
+		const auto &column_ids = index.GetColumnIds();
+		string vec_name = duck_table.GetColumns().GetColumn(PhysicalIndex(column_ids[0])).Name();
+
+		// Filter columns: name -> type mapping (Bool unsupported by the v1
+		// push contract; Set later).
+		vector<sextant_filter_col_def> defs;
+		string filter_sql;
+		for (const auto &name : bind.filter_cols) {
+			auto &col = duck_table.GetColumn(name);
+			int t;
+			switch (col.Type().id()) {
+				case LogicalTypeId::INTEGER:  t = SEXTANT_COL_INT32; break;
+				case LogicalTypeId::BIGINT:   t = SEXTANT_COL_INT64; break;
+				case LogicalTypeId::FLOAT:    t = SEXTANT_COL_FLOAT; break;
+				case LogicalTypeId::VARCHAR:  t = SEXTANT_COL_STRING; break;
+				default:
+					throw BinderException("sextant filter column '%s' has unsupported type %s "
+					                      "(supported: INTEGER, BIGINT, FLOAT, VARCHAR)",
+					                      name, col.Type().ToString());
+			}
+			defs.push_back({name.c_str(), t});
+			state->filter_types.push_back(t);
+			filter_sql += ", " + quoted(name);
+		}
+		// Payload column.
+		string payload_sql;
+		if (!bind.payload_col.empty()) {
+			auto &col = duck_table.GetColumn(bind.payload_col);
+			if (col.Type().id() != LogicalTypeId::VARCHAR) {
+				throw BinderException("sextant payload column '%s' must be VARCHAR, got %s", bind.payload_col,
+				                      col.Type().ToString());
+			}
+			state->has_payload = true;
+			payload_sql = ", " + quoted(bind.payload_col);
+		}
+
 		sextant_build_opts opts = sextant_default_build_opts();
 		char err[512] = {0};
-		state->builder = sextant_build_begin(&opts, state->dim, nullptr, 0, 0, err, sizeof(err));
+		state->builder = sextant_build_begin(
+		    &opts, state->dim, defs.empty() ? nullptr : defs.data(),
+		    static_cast<uint32_t>(defs.size()), state->has_payload ? 1 : 0, err, sizeof(err));
 		if (!state->builder) {
-			throw InvalidInputException("Sextant index '%s': cannot start build: %s",
-			                            index.GetIndexName(), err);
+			throw InvalidInputException("Sextant index '%s': cannot start build: %s", index.GetIndexName(), err);
 		}
+
+		state->context = &input.context;
+		state->scan_sql = "SELECT " + quoted(vec_name) + filter_sql + payload_sql + " FROM " +
+		                  quoted(duck_table.schema.name) + "." + quoted(duck_table.name) + " WHERE " +
+		                  quoted(vec_name) + " IS NOT NULL";
 	}
 
 	return std::move(state);
@@ -317,33 +394,10 @@ unique_ptr<IndexBuildLocalState> SextantIndex::BuildLocalInit(IndexBuildInitLoca
 }
 
 void SextantIndex::BuildSink(IndexBuildSinkInput &input, DataChunk &key_chunk, DataChunk &row_chunk) {
+	// Count only: the vector+filter+payload stream comes from our own scan
+	// at finalize (the generic plan's sink cannot see non-indexed columns).
 	auto &lstate = input.local_state.Cast<SextantLocalState>();
 	lstate.n_rows += row_chunk.size();
-
-	auto &gstate = input.global_state.Cast<SextantGlobalState>();
-	if (!gstate.builder) {
-		return; // attach mode: the sidecar is authoritative, nothing to push
-	}
-
-	// Extract the contiguous FLOAT[d] values from the array column and
-	// push into the engine builder (serialized: the builder handle is not
-	// documented thread-safe; copy cost is negligible vs the build).
-	key_chunk.Flatten();
-	auto &vec_vec = key_chunk.data[0];
-	auto &child = const_cast<Vector &>(ArrayVector::GetEntry(vec_vec));
-	auto *data = FlatVector::GetData<float>(child);
-	const auto count = key_chunk.size();
-
-	lock_guard<mutex> lock(gstate.builder_mu);
-	char err[512] = {0};
-	if (sextant_build_push(gstate.builder, data, static_cast<uint32_t>(count), nullptr, nullptr, nullptr,
-	                       err, sizeof(err)) != 0) {
-		// Fatal for this create; the transaction aborts.
-		sextant_build_abort(gstate.builder);
-		gstate.builder = nullptr;
-		throw InvalidInputException("Sextant index: build push failed at row %llu: %s",
-		                            lstate.n_rows - count, err);
-	}
 }
 
 void SextantIndex::BuildCombine(IndexBuildCombineInput &input) {
@@ -357,21 +411,182 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 	auto &gstate = input.global_state.Cast<SextantGlobalState>();
 	auto &index = gstate.global_index->Cast<SextantIndex>();
 
-	// Build-from-table: run the (blocking) engine build now.
+	// Build-from-table: stream (vector, filters..., payload) rows from our
+	// own scan and push them into the engine builder, then run the build.
 	if (gstate.builder) {
+		D_ASSERT(gstate.context);
+		Connection con(*gstate.context->db);
+		auto result = con.SendQuery(gstate.scan_sql);
+		if (result->HasError()) {
+			sextant_build_abort(gstate.builder);
+			gstate.builder = nullptr;
+			throw InvalidInputException("Sextant index '%s': build scan failed: %s", index.GetIndexName(),
+			                            result->GetError());
+		}
+
+		const idx_t n_filters = gstate.filter_types.size();
+		uint64_t pushed = 0;
+		while (true) {
+			auto chunk = result->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			const idx_t n = chunk->size();
+			auto &data = *chunk;
+			// Column 0: FLOAT[d] values (contiguous in the flat child).
+			auto &vec_vec = data.data[0];
+			auto &child = const_cast<Vector &>(ArrayVector::GetEntry(vec_vec));
+			auto *vecs = FlatVector::GetData<float>(child);
+
+			// Filter columns.
+			vector<const void *> filter_values;
+			vector<vector<int32_t>> i32_bufs;
+			vector<vector<int64_t>> i64_bufs;
+			vector<vector<float>> f32_bufs;
+			vector<sextant_str_values> str_bufs;
+			vector<vector<const char *>> str_ptrs;
+			vector<vector<uint32_t>> str_lens;
+			for (idx_t f = 0; f < n_filters; f++) {
+				auto &col = data.data[1 + f];
+				switch (gstate.filter_types[f]) {
+					case SEXTANT_COL_INT32: {
+						i32_bufs.emplace_back();
+						auto &buf = i32_bufs.back();
+						buf.reserve(n);
+						UnifiedVectorFormat fmt;
+						col.ToUnifiedFormat(n, fmt);
+						auto *d = UnifiedVectorFormat::GetData<int32_t>(fmt);
+						for (idx_t r = 0; r < n; r++) {
+							buf.push_back(fmt.validity.RowIsValid(fmt.sel->get_index(r))
+							                  ? d[fmt.sel->get_index(r)] : 0);
+						}
+						filter_values.push_back(buf.data());
+						break;
+					}
+					case SEXTANT_COL_INT64: {
+						i64_bufs.emplace_back();
+						auto &buf = i64_bufs.back();
+						buf.reserve(n);
+						UnifiedVectorFormat fmt;
+						col.ToUnifiedFormat(n, fmt);
+						auto *d = UnifiedVectorFormat::GetData<int64_t>(fmt);
+						for (idx_t r = 0; r < n; r++) {
+							buf.push_back(fmt.validity.RowIsValid(fmt.sel->get_index(r))
+							                  ? d[fmt.sel->get_index(r)] : 0);
+						}
+						filter_values.push_back(buf.data());
+						break;
+					}
+					case SEXTANT_COL_FLOAT: {
+						f32_bufs.emplace_back();
+						auto &buf = f32_bufs.back();
+						buf.reserve(n);
+						UnifiedVectorFormat fmt;
+						col.ToUnifiedFormat(n, fmt);
+						auto *d = UnifiedVectorFormat::GetData<float>(fmt);
+						for (idx_t r = 0; r < n; r++) {
+							buf.push_back(fmt.validity.RowIsValid(fmt.sel->get_index(r))
+							                  ? d[fmt.sel->get_index(r)] : 0.0f);
+						}
+						filter_values.push_back(buf.data());
+						break;
+					}
+					case SEXTANT_COL_STRING: {
+						str_bufs.emplace_back();
+						str_ptrs.emplace_back();
+						str_lens.emplace_back();
+						auto &sv = str_bufs.back();
+						auto &ptrs = str_ptrs.back();
+						auto &lens = str_lens.back();
+						ptrs.reserve(n);
+						lens.reserve(n);
+						UnifiedVectorFormat fmt;
+						col.ToUnifiedFormat(n, fmt);
+						auto *d = UnifiedVectorFormat::GetData<string_t>(fmt);
+						for (idx_t r = 0; r < n; r++) {
+							const auto i = fmt.sel->get_index(r);
+							if (fmt.validity.RowIsValid(i)) {
+								const auto s = d[i];
+								if (s.GetSize() > 65535) {
+									throw InvalidInputException("Sextant index: filter string exceeds 65535 "
+									                            "bytes at row %llu",
+									                            (unsigned long long)(pushed + r));
+								}
+								ptrs.push_back(s.GetData());
+								lens.push_back(s.GetSize());
+							} else {
+								ptrs.push_back("");
+								lens.push_back(0);
+							}
+						}
+						sv.data = ptrs.data();
+						sv.lengths = lens.data();
+						filter_values.push_back(&sv);
+						break;
+					}
+					default:
+						throw InternalException("sextant: unhandled filter type");
+				}
+			}
+
+			// Payload: blobs appended into one buffer + offsets.
+			vector<uint64_t> payload_offsets;
+			vector<uint8_t> payload_data;
+			const uint8_t *payload_ptr = nullptr;
+			const uint64_t *payload_off = nullptr;
+			if (gstate.has_payload) {
+				auto &col = data.data[1 + n_filters];
+				payload_offsets.reserve(n + 1);
+				payload_offsets.push_back(0);
+				UnifiedVectorFormat fmt;
+				col.ToUnifiedFormat(n, fmt);
+				auto *d = UnifiedVectorFormat::GetData<string_t>(fmt);
+				for (idx_t r = 0; r < n; r++) {
+					const auto i = fmt.sel->get_index(r);
+					if (fmt.validity.RowIsValid(i)) {
+						payload_data.insert(payload_data.end(), d[i].GetData(),
+						                    d[i].GetData() + d[i].GetSize());
+					}
+					payload_offsets.push_back(payload_data.size());
+				}
+				payload_ptr = payload_data.data();
+				payload_off = payload_offsets.data();
+			}
+
+			char err[512] = {0};
+			if (sextant_build_push(gstate.builder, vecs, static_cast<uint32_t>(n),
+			                       filter_values.empty() ? nullptr : filter_values.data(), payload_off,
+			                       payload_ptr, err, sizeof(err)) != 0) {
+				sextant_build_abort(gstate.builder);
+				gstate.builder = nullptr;
+				throw InvalidInputException("Sextant index: build push failed at row %llu: %s",
+				                            (unsigned long long)pushed, err);
+			}
+			pushed += n;
+		}
+
+		if (pushed != gstate.n_rows.load()) {
+			sextant_build_abort(gstate.builder);
+			gstate.builder = nullptr;
+			throw InvalidInputException(
+			    "Sextant index '%s': build scan saw %llu rows but the index plan saw %llu — uncommitted "
+			    "table data or concurrent modification. Commit the table data before creating the index.",
+			    index.GetIndexName(), (unsigned long long)pushed, (unsigned long long)gstate.n_rows.load());
+		}
+
 		char err[512] = {0};
 		const string out_path = index.GetSidecarPath();
 		if (sextant_build_finish(gstate.builder, out_path.c_str(), err, sizeof(err)) != 0) {
-			// finish() frees the builder on failure too.
 			gstate.builder = nullptr;
 			throw InvalidInputException("Sextant index '%s': build failed: %s", index.GetIndexName(), err);
 		}
 		gstate.builder = nullptr;
+		index.n_build = pushed;
+	} else {
+		index.n_build = gstate.n_rows.load();
 	}
 
-	// Record n_build and attach + verify the sidecar before the index
-	// becomes visible: a missing or wrong tree fails CREATE INDEX itself.
-	index.n_build = gstate.n_rows.load();
+	// Attach + verify the sidecar before the index becomes visible.
 	index.AttachAndVerify();
 
 	return std::move(gstate.global_index);
