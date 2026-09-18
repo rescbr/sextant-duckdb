@@ -2,6 +2,7 @@
 
 #include "sextant_extension.hpp"
 #include "sextant_index.hpp"
+#include "sextant_scan.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -28,6 +29,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    ScalarFunction("sextant_version", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SextantVersionFun));
 	RegisterSextantIndexType(loader.GetDatabaseInstance());
 	RegisterSextantImmutabilityOptimizer(loader.GetDatabaseInstance());
+	RegisterSextantScanFunction(loader.GetDatabaseInstance());
 }
 
 void SextantExtension::Load(ExtensionLoader &loader) {

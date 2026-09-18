@@ -1,0 +1,49 @@
+# name: test/sql/sextant_scan.test
+# description: sextant_query unfiltered ANN scan vs brute force
+# group: [sql]
+
+require sextant
+
+load __TEST_DIR__/sextant_scan.db
+
+# 8 well-separated clusters (0.3 apart, 0.02 noise), 250 rows each.
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'scan.tree')
+
+# Query = cluster-3 center (0.9 in every dim). All top-20 results must be
+# cluster-3 members ((rowid % 8) = 3) — matches engine-CLI behavior on the
+# same fixture (identical rows and distances).
+query I
+SELECT count(*) AS bad FROM sextant_query('t', 'idx', list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32], 20) s WHERE s.row_id % 8 != 3
+----
+0
+
+# Distances ascend (or tie) along the result order.
+query I
+SELECT count(*) AS unordered FROM (SELECT distance, lag(distance) OVER () AS prev FROM sextant_query('t', 'idx', list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32], 20)) WHERE prev IS NOT NULL AND distance < prev
+----
+0
+
+# Quality bound: sextant's worst top-20 distance stays within 4x of the
+# brute-force top-20 worst (tie-saturated fixture makes set identity the
+# wrong assertion — decoded distances quantize intra-cluster noise flat).
+query I
+WITH bf AS (SELECT max(array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32])) AS worst FROM (SELECT v FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20)),
+sx AS (SELECT max(distance) AS worst FROM sextant_query('t', 'idx', list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32], 20))
+SELECT CASE WHEN sx.worst <= 4 * bf.worst THEN 1 ELSE 0 END AS ok FROM bf, sx
+----
+1
+
+# Error paths: unknown index, dimension mismatch.
+statement error
+SELECT * FROM sextant_query('t', 'nope', list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32], 10)
+----
+no sextant index named 'nope'
+
+statement error
+SELECT * FROM sextant_query('t', 'idx', [0.5, 0.5, 0.5], 10)
+----
+dimension

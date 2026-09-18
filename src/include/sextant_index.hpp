@@ -78,6 +78,10 @@ public:
 	const string &GetSidecarPath() const {
 		return sidecar_path;
 	}
+	/// Cached engine handle (null until attached).
+	void *GetEngineHandle() const {
+		return engine_handle;
+	}
 
 private:
 	/// Serialize (path, uuid, n_build) into the linked-block blob.
