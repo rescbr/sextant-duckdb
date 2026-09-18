@@ -116,6 +116,16 @@ static unique_ptr<GlobalTableFunctionState> SextantQueryInitGlobal(ClientContext
 
 	sextant_search_opts opts = sextant_default_search_opts();
 	opts.k = bind_data.k;
+	// Per-query within-query parallelism (session setting; default 1 —
+	// DuckDB supplies cross-query parallelism via its own threads).
+	Value st;
+	if (context.TryGetCurrentSetting("sextant_search_threads", st)) {
+		const int64_t n = st.GetValue<int64_t>();
+		if (n < 0 || n > 1024) {
+			throw InvalidInputException("sextant_search_threads must be in [0, 1024]");
+		}
+		opts.search_threads = static_cast<uint32_t>(n);
+	}
 	// Adaptive-W tau, CLI AUTO parity (code_size >= 288B -> 2.5 else 5.0):
 	// without it the shortlist is fixed at W~k and recall collapses (a
 	// clustered 2000x32 fixture scored 10/20 vs 20/20 with the wide cut).
