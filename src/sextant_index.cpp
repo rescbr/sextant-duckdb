@@ -358,9 +358,10 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 				case LogicalTypeId::BIGINT:   t = SEXTANT_COL_INT64; break;
 				case LogicalTypeId::FLOAT:    t = SEXTANT_COL_FLOAT; break;
 				case LogicalTypeId::VARCHAR:  t = SEXTANT_COL_STRING; break;
+				case LogicalTypeId::BOOLEAN:  t = SEXTANT_COL_BOOL; break;
 				default:
 					throw BinderException("sextant filter column '%s' has unsupported type %s "
-					                      "(supported: INTEGER, BIGINT, FLOAT, VARCHAR)",
+					                      "(supported: INTEGER, BIGINT, FLOAT, VARCHAR, BOOLEAN)",
 					                      name, col.Type().ToString());
 			}
 			defs.push_back({name.c_str(), t});
@@ -454,6 +455,7 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 			vector<vector<int32_t>> i32_bufs;
 			vector<vector<int64_t>> i64_bufs;
 			vector<vector<float>> f32_bufs;
+			vector<vector<uint8_t>> bool_bufs;
 			vector<sextant_str_values> str_bufs;
 			vector<vector<const char *>> str_ptrs;
 			vector<vector<uint32_t>> str_lens;
@@ -462,6 +464,7 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 			i32_bufs.reserve(n_filters);
 			i64_bufs.reserve(n_filters);
 			f32_bufs.reserve(n_filters);
+			bool_bufs.reserve(n_filters);
 			str_bufs.reserve(n_filters);
 			str_ptrs.reserve(n_filters);
 			str_lens.reserve(n_filters);
@@ -506,6 +509,21 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 						for (idx_t r = 0; r < n; r++) {
 							buf.push_back(fmt.validity.RowIsValid(fmt.sel->get_index(r))
 							                  ? d[fmt.sel->get_index(r)] : 0.0f);
+						}
+						filter_values.push_back(buf.data());
+						break;
+					}
+					case SEXTANT_COL_BOOL: {
+						// Engine expects 1-byte-per-row 0/1 (NULL maps to 0).
+						bool_bufs.emplace_back();
+						auto &buf = bool_bufs.back();
+						buf.reserve(n);
+						UnifiedVectorFormat fmt;
+						col.ToUnifiedFormat(n, fmt);
+						auto *d = UnifiedVectorFormat::GetData<bool>(fmt);
+						for (idx_t r = 0; r < n; r++) {
+							buf.push_back(fmt.validity.RowIsValid(fmt.sel->get_index(r)) &&
+							               d[fmt.sel->get_index(r)] ? 1 : 0);
 						}
 						filter_values.push_back(buf.data());
 						break;
