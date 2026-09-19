@@ -62,24 +62,28 @@ bool EvalDeltaPredicate(const SextantScanPredicate &p, bool is_null, double nume
 	}
 }
 
+} // namespace
+
 /// Append-only delta serving: brute-force rows past n_build (DELETE is
 /// fenced, so those row ids are dense and stable), compute squared-L2
 /// distances to the query, apply the translated predicates, and merge the
-/// best candidates into the engine's (rowid, dist) result.
-void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind_data,
+/// best candidates into the engine's (rowid, dist) result. Shared by the
+/// top-k rewrite scan and the debug sextant_query() function.
+void MergeDeltaRows(ClientContext &context, DuckTableEntry &table, SextantIndex &index,
+                    const vector<float> &query, idx_t k, const vector<SextantScanPredicate> &predicates,
                     vector<uint64_t> &row_ids, vector<float> &dists) {
-	auto &duck_table = *bind_data.table;
-	const idx_t n_build = bind_data.index->GetNBuild();
+	auto &duck_table = table;
+	const idx_t n_build = index.GetNBuild();
 	const idx_t total = duck_table.GetStorage().GetTotalRows();
 
 	// Defensive: the recorded build boundary must match the tree's actual
 	// row count (guarded at CREATE INDEX for prebuilt attaches; this
 	// catches a metadata blob desynced from the sidecar).
-	const uint64_t tree_rows = sextant_index_count(bind_data.index->GetEngineHandle());
+	const uint64_t tree_rows = sextant_index_count(index.GetEngineHandle());
 	if (tree_rows != n_build) {
 		throw InvalidInputException("Sextant index '%s': tree holds %llu rows but n_build is %llu — drop "
 		                            "and re-create the index",
-		                            bind_data.index->GetIndexName(), (unsigned long long)tree_rows,
+		                            index.GetIndexName(), (unsigned long long)tree_rows,
 		                            (unsigned long long)n_build);
 	}
 
@@ -88,7 +92,7 @@ void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind
 	}
 
 	// Resolve fetch columns: [vector column, predicate columns...].
-	const idx_t vec_col = bind_data.index->GetColumnIds()[0];
+	const idx_t vec_col = index.GetColumnIds()[0];
 	vector<StorageIndex> fetch_cols = {StorageIndex(vec_col)};
 	vector<LogicalType> fetch_types;
 	vector<idx_t> pred_col_ids; // index into fetch_cols (1..)
@@ -99,7 +103,7 @@ void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind
 			by_name[columns.GetColumn(PhysicalIndex(c)).Name()] = c;
 		}
 		fetch_types.push_back(columns.GetColumn(PhysicalIndex(vec_col)).Type());
-		for (const auto &pred : bind_data.predicates) {
+		for (const auto &pred : predicates) {
 			const auto it = by_name.find(pred.column);
 			if (it == by_name.end() || it->second == vec_col) {
 				return; // predicate column vanished: serve tree rows only
@@ -112,23 +116,23 @@ void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind
 
 	auto &transaction = DuckTransaction::Get(context, duck_table.catalog);
 	ColumnFetchState fetch_state;
-	const idx_t dim = bind_data.query.size();
+	const idx_t dim = query.size();
 	// Merge score: squared-L2 ascending for L2 trees; negated inner
 	// product ascending (= q·x descending) for IP trees — matching the
 	// engine's best-first ordering.
-	const bool ip_metric = bind_data.index->GetEngineHandle() != nullptr &&
-	                       sextant_index_metric(bind_data.index->GetEngineHandle()) == SEXTANT_METRIC_IP;
+	const bool ip_metric = index.GetEngineHandle() != nullptr &&
+	                       sextant_index_metric(index.GetEngineHandle()) == SEXTANT_METRIC_IP;
 	const auto score_of = [&](const float *v) {
 		if (ip_metric) {
 			float dot = 0.0f;
 			for (idx_t j = 0; j < dim; j++) {
-				dot += v[j] * bind_data.query[j];
+				dot += v[j] * query[j];
 			}
 			return -dot;
 		}
 		float d = 0.0f;
 		for (idx_t j = 0; j < dim; j++) {
-			const float diff = v[j] - bind_data.query[j];
+			const float diff = v[j] - query[j];
 			d += diff * diff;
 		}
 		return d;
@@ -137,9 +141,9 @@ void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind
 	chunk.Initialize(Allocator::DefaultAllocator(), fetch_types);
 
 	// Max-heap-style candidate tracking: keep the best `keep` delta rows.
-	const size_t keep = bind_data.k;
+	const size_t keep = k;
 	vector<std::pair<float, uint64_t>> cand;
-	const size_t n_pred = bind_data.predicates.size();
+	const size_t n_pred = predicates.size();
 
 	for (idx_t start = n_build; start < total; start += STANDARD_VECTOR_SIZE) {
 		const idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total - start);
@@ -190,7 +194,7 @@ void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind
 						}
 					}
 				}
-				pass = EvalDeltaPredicate(bind_data.predicates[pi], is_null, numeric, str);
+				pass = EvalDeltaPredicate(predicates[pi], is_null, numeric, str);
 			}
 			if (!pass) {
 				continue;
@@ -248,8 +252,6 @@ void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind
 		dists.push_back(m.first);
 	}
 }
-
-} // namespace
 
 struct SextantIndexScanGlobalState : public GlobalTableFunctionState {
 	ColumnFetchState fetch_state;
@@ -347,7 +349,8 @@ static unique_ptr<GlobalTableFunctionState> SextantIndexScanInitGlobal(ClientCon
 
 	// Append-only delta serving: merge brute-forced rows past n_build.
 	if (bind_data.index->GetDeltaScan()) {
-		MergeDeltaRows(context, bind_data, result->row_ids, dists);
+		MergeDeltaRows(context, *bind_data.table, *bind_data.index, bind_data.query, bind_data.k,
+		               bind_data.predicates, result->row_ids, dists);
 	}
 
 	result->column_ids.reserve(input.column_indexes.size());

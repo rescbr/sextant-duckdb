@@ -118,3 +118,15 @@ query I
 SELECT count(*) AS bad FROM (SELECT rowid FROM p ORDER BY array_distance(v, list_transform(range(32), j -> ((5*32+j)%97)::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid >= 2000
 ----
 0
+
+# sextant_query() parity: the debug function must also serve delta rows
+# (same merge as the rewrite path).
+query I
+SELECT count(*) AS bad FROM (SELECT row_id FROM sextant_query('p', 'pi', list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32], 20)) WHERE row_id < 2000
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT row_id FROM sextant_query('p', 'pi', list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32], 20))
+----
+20

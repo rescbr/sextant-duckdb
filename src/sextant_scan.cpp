@@ -1,4 +1,5 @@
 #include "sextant_index.hpp"
+#include "sextant_index_scan.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -142,6 +143,15 @@ static unique_ptr<GlobalTableFunctionState> SextantQueryInitGlobal(ClientContext
 	result->row_ids.resize(n);
 	result->dists.resize(n);
 
+	// Parity with the top-k rewrite: delta_scan indexes serve appended
+	// rows (past n_build) by brute force. Note distances are recomputed
+	// exactly on this path (squared-L2 / negated dot), unlike the pure
+	// engine scores above.
+	if (bind_data.index->GetDeltaScan()) {
+		MergeDeltaRows(context, *bind_data.table, *bind_data.index, bind_data.query, bind_data.k, {},
+		               result->row_ids, result->dists);
+	}
+
 	return std::move(result);
 }
 
@@ -174,6 +184,10 @@ void RegisterSextantScanFunction(DatabaseInstance &db) {
 	                                     LogicalType::ANY, LogicalType::BIGINT},
 	                   SextantQueryFunction, SextantQueryBind, SextantQueryInitGlobal);
 	func.cardinality = SextantQueryCardinality;
+	// Debug/introspection surface. Parity with the SQL top-k rewrite:
+	// L2 + IP trees, delta_scan appends. NOT supported: WHERE
+	// predicates — use ORDER BY array_distance LIMIT k for filtered
+	// queries.
 	ExtensionLoader loader(db, "sextant");
 	loader.RegisterFunction(func);
 }
