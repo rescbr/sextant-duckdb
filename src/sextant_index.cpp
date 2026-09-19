@@ -240,6 +240,7 @@ struct SextantBindData : public IndexBuildBindData {
 	int64_t build_threads = 0;  // WITH (build_threads = N): engine build threads
 	int64_t staging_bytes = 0;   // WITH (staging_bytes = N): push-staging RAM budget
 	string metrics_file;         // WITH (metrics_file = '...'): jsonl phase metrics
+	bool metric_ip = false;      // WITH (metric = 'ip'): inner-product tree
 };
 
 struct SextantGlobalState : public IndexBuildGlobalState {
@@ -267,7 +268,7 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 
 	// Validate options strictly.
 		static const char *const kKnown[] = {"path", "delta_scan", "prebuilt", "filter_cols", "payload_col",
-		                                "build_threads", "staging_bytes", "metrics_file"};
+		                                "build_threads", "staging_bytes", "metrics_file", "metric"};
 	for (const auto &opt : info.options) {
 		bool known = false;
 		for (auto *k : kKnown) {
@@ -329,6 +330,14 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 	}
 	if (auto mf = info.options.find("metrics_file"); mf != info.options.end()) {
 		bind->metrics_file = mf->second.ToString();
+	}
+	if (auto m = info.options.find("metric"); m != info.options.end()) {
+		const string metric = StringUtil::Lower(m->second.ToString());
+		if (metric == "ip" || metric == "inner_product" || metric == "innerproduct") {
+			bind->metric_ip = true;
+		} else if (metric != "l2" && metric != "l2sq" && metric != "euclidean") {
+			throw BinderException("sextant metric must be 'l2' (default) or 'ip', got '%s'", metric);
+		}
 	}
 	return std::move(bind);
 }
@@ -402,6 +411,9 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 			opts.num_threads = static_cast<uint32_t>(bind.build_threads);
 		}
 		opts.staging_bytes = static_cast<uint64_t>(bind.staging_bytes);
+		if (bind.metric_ip) {
+			opts.metric = SEXTANT_METRIC_IP;
+		}
 		state->metrics_file = bind.metrics_file;  // owns the c_str() below
 		opts.metrics_path = state->metrics_file.c_str();
 		char err[512] = {0};

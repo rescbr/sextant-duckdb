@@ -101,6 +101,26 @@ void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind
 	auto &transaction = DuckTransaction::Get(context, duck_table.catalog);
 	ColumnFetchState fetch_state;
 	const idx_t dim = bind_data.query.size();
+	// Merge score: squared-L2 ascending for L2 trees; negated inner
+	// product ascending (= q·x descending) for IP trees — matching the
+	// engine's best-first ordering.
+	const bool ip_metric = bind_data.index->GetEngineHandle() != nullptr &&
+	                       sextant_index_metric(bind_data.index->GetEngineHandle()) == SEXTANT_METRIC_IP;
+	const auto score_of = [&](const float *v) {
+		if (ip_metric) {
+			float dot = 0.0f;
+			for (idx_t j = 0; j < dim; j++) {
+				dot += v[j] * bind_data.query[j];
+			}
+			return -dot;
+		}
+		float d = 0.0f;
+		for (idx_t j = 0; j < dim; j++) {
+			const float diff = v[j] - bind_data.query[j];
+			d += diff * diff;
+		}
+		return d;
+	};
 	DataChunk chunk;
 	chunk.Initialize(Allocator::DefaultAllocator(), fetch_types);
 
@@ -134,13 +154,7 @@ void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind
 			if (!vfmt.validity.RowIsValid(vi)) {
 				continue; // NULL vector: never indexed
 			}
-			// Squared L2 (the engine's L2SQ ranking scale).
-			float d = 0.0f;
-			const float *v = vecs + static_cast<size_t>(vi) * dim;
-			for (idx_t j = 0; j < dim; j++) {
-				const float diff = v[j] - bind_data.query[j];
-				d += diff * diff;
-			}
+			const float d = score_of(vecs + static_cast<size_t>(vi) * dim);
 
 			bool pass = true;
 			for (size_t pi = 0; pi < n_pred && pass; pi++) {
@@ -196,13 +210,7 @@ void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind
 				dists[i] = std::numeric_limits<float>::max();
 				continue;
 			}
-			float d = 0.0f;
-			const float *v = evecs + static_cast<size_t>(ei) * dim;
-			for (idx_t j = 0; j < dim; j++) {
-				const float diff = v[j] - bind_data.query[j];
-				d += diff * diff;
-			}
-			dists[i] = d;
+			dists[i] = score_of(evecs + static_cast<size_t>(ei) * dim);
 		}
 	}
 

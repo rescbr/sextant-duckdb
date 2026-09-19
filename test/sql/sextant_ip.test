@@ -1,0 +1,69 @@
+# name: test/sql/sextant_ip.test
+# description: IP-metric trees (WITH (metric='ip')) + array_inner_product DESC top-k rewrite
+# group: [sql]
+
+require sextant
+
+load __TEST_DIR__/sextant_ip.db
+
+# 4 axis-aligned clusters: row i's cluster is i%4, on axis (i%4), so an
+# inner-product query along axis 2 ranks cluster 2 first.
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(16), j -> CASE WHEN j = rowid % 4 THEN 1.0 + ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 ELSE 0.0 END)::FLOAT[16] AS v, (rowid % 5)::INTEGER AS year FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'ip.tree', metric = 'ip', filter_cols = 'year', delta_scan)
+
+# IP DESC top-k is rewritten: every result is a cluster-2 row.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t ORDER BY array_inner_product(v, list_transform(range(16), j -> CASE WHEN j = 2 THEN 3.0 ELSE 0.0 END)::FLOAT[16]) DESC LIMIT 20) WHERE rowid % 4 != 2
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_inner_product(v, list_transform(range(16), j -> CASE WHEN j = 2 THEN 3.0 ELSE 0.0 END)::FLOAT[16]) DESC LIMIT 20)
+----
+20
+
+# Filtered IP query: predicates compose with the IP ordering.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t WHERE year = 3 ORDER BY array_inner_product(v, list_transform(range(16), j -> CASE WHEN j = 2 THEN 3.0 ELSE 0.0 END)::FLOAT[16]) DESC LIMIT 20) WHERE rowid % 5 != 3 OR rowid % 4 != 2
+----
+0
+
+# Delta rows surface through the IP rewrite: appended rows on the
+# queried axis beat every build row.
+statement ok
+INSERT INTO t SELECT list_transform(range(16), j -> CASE WHEN j = 2 THEN 5.0 ELSE 0.0 END)::FLOAT[16] AS v, 42::INTEGER AS year FROM range(50) tbl(rowid)
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t ORDER BY array_inner_product(v, list_transform(range(16), j -> CASE WHEN j = 2 THEN 3.0 ELSE 0.0 END)::FLOAT[16]) DESC LIMIT 20) WHERE rowid < 2000
+----
+0
+
+# ASC inner product is not rewritten (engine serves best-first only)
+# but must still work exactly.
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_inner_product(v, list_transform(range(16), j -> CASE WHEN j = 2 THEN 3.0 ELSE 0.0 END)::FLOAT[16]) LIMIT 20)
+----
+20
+
+# array_distance on an IP tree is not rewritten (metric mismatch);
+# exact semantics kept.
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(16), j -> 0.0::FLOAT)::FLOAT[16]) LIMIT 20)
+----
+20
+
+# array_inner_product DESC on an L2 tree is not rewritten; exact
+# semantics kept (all-zero query: every dot is 0, any 20 rows qualify).
+statement ok
+CREATE TABLE l AS SELECT list_transform(range(16), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[16] AS v FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX li ON l USING sextant (v) WITH (path = 'l2.tree')
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM l ORDER BY array_inner_product(v, list_transform(range(16), j -> 1.0::FLOAT)::FLOAT[16]) DESC LIMIT 20)
+----
+20

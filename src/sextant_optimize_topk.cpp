@@ -37,14 +37,23 @@ namespace duckdb {
 //------------------------------------------------------------------------------
 
 /// Extract (constant query vector, indexed-column binding) from an
-/// array_distance(colref/const, const/colref) expression.
+/// array_distance(colref/const, const/colref) (L2 trees) or
+/// array_inner_product(...) (IP trees) expression. `is_ip` receives the
+/// matched kind.
 static bool TryMatchDistanceExpression(const Expression &expr, const ColumnBinding &probe,
-                                       vector<float> &query_out) {
+                                       vector<float> &query_out, bool &is_ip) {
 	if (expr.GetExpressionType() != ExpressionType::BOUND_FUNCTION) {
 		return false;
 	}
 	auto &func = expr.Cast<BoundFunctionExpression>();
-	if (func.children.size() != 2 || func.function.name != "array_distance") {
+	if (func.children.size() != 2) {
+		return false;
+	}
+	if (func.function.name == "array_distance") {
+		is_ip = false;
+	} else if (func.function.name == "array_inner_product") {
+		is_ip = true;
+	} else {
 		return false;
 	}
 	Expression *const_side = nullptr;
@@ -317,33 +326,28 @@ static bool TryTranslateTableFilters(LogicalGet &get, DuckTableEntry &table, voi
 }
 
 static bool TryRewriteTopN(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
+	if (plan->type == LogicalOperatorType::LOGICAL_TOP_N) {	}
 	if (plan->type != LogicalOperatorType::LOGICAL_TOP_N) {
 		return false;
 	}
 	auto &top_n = plan->Cast<LogicalTopN>();
-	if (top_n.orders.size() != 1 || top_n.limit == 0 || top_n.offset != 0) {
-		return false;
+	if (top_n.orders.size() != 1 || top_n.limit == 0 || top_n.offset != 0) {		return false;
 	}
 	const auto &order = top_n.orders[0];
-	if (order.type != OrderType::ASCENDING || order.null_order != OrderByNullType::NULLS_LAST) {
-		return false;
+	if (order.null_order != OrderByNullType::NULLS_LAST) {		return false;
 	}
-	if (order.expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-		return false;
+	if (order.expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {		return false;
 	}
 	auto &order_col = order.expression->Cast<BoundColumnRefExpression>();
 	(void)order_col;
 
-	if (top_n.children.size() != 1 || top_n.children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {
-		return false;
+	if (top_n.children.size() != 1 || top_n.children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {		return false;
 	}
 	auto &projection = top_n.children[0]->Cast<LogicalProjection>();
-	if (projection.children.size() != 1 || projection.children[0]->type != LogicalOperatorType::LOGICAL_GET) {
-		return false;
+	if (projection.children.size() != 1 || projection.children[0]->type != LogicalOperatorType::LOGICAL_GET) {		return false;
 	}
 	auto &get = projection.children[0]->Cast<LogicalGet>();
-	if (get.function.name != "seq_scan" || !get.GetTable()) {
-		return false;
+	if (get.function.name != "seq_scan" || !get.GetTable()) {		return false;
 	}
 	if (!get.table_filters.filters.empty() && (get.dynamic_filters && get.dynamic_filters->HasFilters())) {
 		return false;
@@ -356,30 +360,43 @@ static bool TryRewriteTopN(ClientContext &context, unique_ptr<LogicalOperator> &
 	}
 	const Expression &distance_expr = *projection.expressions[order_index];
 
+	// Metric kind from the expression's function: array_distance (L2,
+	// ASC) or array_inner_product (IP, DESC). The direction must match.
+	{
+		bool expr_is_ip = false;
+		if (distance_expr.GetExpressionType() == ExpressionType::BOUND_FUNCTION) {
+			const auto &name = distance_expr.Cast<BoundFunctionExpression>().function.name;
+			expr_is_ip = name == "array_inner_product";
+		}
+		const bool want_desc = expr_is_ip;
+		if (order.type != (want_desc ? OrderType::DESCENDING : OrderType::ASCENDING)) {			return false;
+		}
+	}
+
 	auto &table = get.GetTable()->Cast<DuckTableEntry>();
 	if (!table.IsDuckTable()) {
 		return false;
 	}
 	auto &storage = table.GetStorage();
 	storage.BindIndexes(context);
-
 	for (auto &index_entry : storage.GetDataTableInfo()->GetIndexes().IndexEntries()) {
 		if (!index_entry.index || index_entry.index->GetIndexType() != SextantIndex::TYPE_NAME) {
 			continue;
 		}
 		auto &index = index_entry.index->Cast<SextantIndex>();
 		auto handle = index.GetEngineHandle();
-		if (!handle) {
-			continue;
+		if (!handle) {			continue;
 		}
-		// array_distance is euclidean: only valid for L2 trees.
-		if (sextant_index_metric(handle) != SEXTANT_METRIC_L2SQ) {
-			continue;
+		// The expression kind must match the tree's metric
+		// (array_distance ↔ L2, array_inner_product ↔ IP).
+		const bool tree_is_ip = sextant_index_metric(handle) == SEXTANT_METRIC_IP;
+		const bool expr_is_ip = distance_expr.GetExpressionType() == ExpressionType::BOUND_FUNCTION &&
+		                        distance_expr.Cast<BoundFunctionExpression>().function.name == "array_inner_product";
+		if (tree_is_ip != expr_is_ip) {			continue;
 		}
 		// The index must be over exactly the column the distance
 		// expression references.
-		if (index.GetColumnIds().size() != 1) {
-			continue;
+		if (index.GetColumnIds().size() != 1) {			continue;
 		}
 
 		vector<float> query;
@@ -401,13 +418,15 @@ static bool TryRewriteTopN(ClientContext &context, unique_ptr<LogicalOperator> &
 				continue;
 			}
 			bool matched = false;
+			bool is_ip = false;
 			if (col < get_bindings.size() && get_bindings[col].column_index == col) {
-				matched = TryMatchDistanceExpression(distance_expr, get_bindings[col], query);
+				matched = TryMatchDistanceExpression(distance_expr, get_bindings[col], query, is_ip);
 			}
 			if (!matched) {
 				matched = TryMatchDistanceExpression(
-				    distance_expr, ColumnBinding(get.table_index, static_cast<column_t>(col)), query);
+				    distance_expr, ColumnBinding(get.table_index, static_cast<column_t>(col)), query, is_ip);
 			}
+			(void)is_ip; // metric agreement checked above
 			if (!matched) {
 				continue;
 			}
