@@ -245,6 +245,60 @@ static bool TryTranslateOneFilter(const TableFilter &filter, const string &col_n
 			if (and_filter.child_filters.empty()) {
 				return false;
 			}
+			// DuckDB pushes `col LIKE 'p%'` down as the bytewise range
+			// `col >= 'p' AND col < 'p[last]++'` (filter_combiner,
+			// PUSHED_DOWN_PARTIALLY — the LIKE itself stays above, so
+			// exact semantics are preserved regardless). The range is
+			// bytewise-equivalent to a prefix test, which the engine
+			// evaluates natively (SEXTANT_PRED_PREFIX).
+			if (and_filter.child_filters.size() == 2 && engine_col_type == SEXTANT_COL_STRING) {
+				const ConstantFilter *ge = nullptr;
+				const ConstantFilter *lt = nullptr;
+				for (const auto &child : and_filter.child_filters) {
+					if (child->filter_type != TableFilterType::CONSTANT_COMPARISON) {
+						ge = nullptr;
+						break;
+					}
+					auto &cf = child->Cast<ConstantFilter>();
+					if (cf.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO && !ge) {
+						ge = &cf;
+					} else if (cf.comparison_type == ExpressionType::COMPARE_LESSTHAN && !lt) {
+						lt = &cf;
+					} else {
+						ge = nullptr;
+						break;
+					}
+				}
+				if (ge && lt && ge->constant.type().id() == LogicalTypeId::VARCHAR &&
+				    lt->constant.type().id() == LogicalTypeId::VARCHAR) {
+					const string lo = ge->constant.ToString();
+					const string hi = lt->constant.ToString();
+					// Mirror DuckDB's transform: increment the last
+					// byte of the prefix.
+					if (!lo.empty() && hi.size() == lo.size()) {
+						string inc = lo;
+						inc.back()++;
+						if (hi == inc) {
+							auto &pred = preds.emplace_back();
+							pred.column = col_name;
+							pred.op = SEXTANT_PRED_PREFIX;
+							pred.str_value = lo;
+							// Re-injection keeps the exact range form
+							// (equivalent to the prefix bytewise).
+							auto conj = make_uniq<BoundConjunctionExpression>(
+							    ExpressionType::CONJUNCTION_AND);
+							conj->children.push_back(make_uniq<BoundComparisonExpression>(
+							    ExpressionType::COMPARE_GREATERTHANOREQUALTO, colref->Copy(),
+							    make_uniq<BoundConstantExpression>(ge->constant)));
+							conj->children.push_back(make_uniq<BoundComparisonExpression>(
+							    ExpressionType::COMPARE_LESSTHAN, colref->Copy(),
+							    make_uniq<BoundConstantExpression>(lt->constant)));
+							sql_exprs.push_back(std::move(conj));
+							return true;
+						}
+					}
+				}
+			}
 			auto conj = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
 			for (const auto &child : and_filter.child_filters) {
 				if (!TryTranslateOneFilter(*child, col_name, engine_col_type, preds, conj->children, col_binding,

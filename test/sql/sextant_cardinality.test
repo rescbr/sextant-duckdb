@@ -45,3 +45,16 @@ query I
 SELECT count(*) FROM (SELECT rowid FROM s WHERE grp = 2 ORDER BY array_distance(v, list_transform(range(32), j -> 0.6::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 2
 ----
 0
+
+# LIKE 'p%' reaches the engine as the bytewise range [p, p[last]++),
+# translated to SEXTANT_PRED_PREFIX. 'ra%' matches exactly the 4 rare
+# rows (also exercises the tiny-set brute-force path).
+query I
+SELECT count(*) FROM (SELECT rowid FROM t WHERE tag LIKE 'ra%' ORDER BY array_distance(v, list_transform(range(32), j -> 0.1::FLOAT)::FLOAT[32]) LIMIT 10)
+----
+4
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM t WHERE tag LIKE 'comm%' ORDER BY array_distance(v, list_transform(range(32), j -> 0.1::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 0
+----
+0
