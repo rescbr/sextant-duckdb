@@ -4,8 +4,15 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -79,8 +86,188 @@ static bool TryMatchDistanceExpression(const Expression &expr, const ColumnBindi
 	return true;
 }
 
-static bool TryRewriteTopN(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
-	if (plan->type != LogicalOperatorType::LOGICAL_TOP_N) {
+//------------------------------------------------------------------------------
+// Filter translation: DuckDB pushed-down TableFilters -> engine predicates.
+// Only translatable subsets qualify the rewrite (numeric/string/bool
+// comparisons and IN on engine filter columns); anything else bails.
+// Because the engine stores NULL filter values as 0/"" at build time,
+// engine predicate semantics differ from SQL on NULLs — so the rewrite
+// also re-injects an exact SQL LogicalFilter above the scan and treats
+// the engine predicates as recall-shaping only.
+//------------------------------------------------------------------------------
+
+static int EnginePredOp(ExpressionType t) {
+	switch (t) {
+		case ExpressionType::COMPARE_EQUAL:                return SEXTANT_PRED_EQ;
+		case ExpressionType::COMPARE_NOTEQUAL:             return SEXTANT_PRED_NEQ;
+		case ExpressionType::COMPARE_LESSTHAN:             return SEXTANT_PRED_LT;
+		case ExpressionType::COMPARE_LESSTHANOREQUALTO:    return SEXTANT_PRED_LE;
+		case ExpressionType::COMPARE_GREATERTHAN:          return SEXTANT_PRED_GT;
+		case ExpressionType::COMPARE_GREATERTHANOREQUALTO: return SEXTANT_PRED_GE;
+		default:                                           return -1;
+	}
+}
+
+static int EngineColType(const LogicalType &t) {
+	switch (t.id()) {
+		case LogicalTypeId::INTEGER: return SEXTANT_COL_INT32;
+		case LogicalTypeId::BIGINT:  return SEXTANT_COL_INT64;
+		case LogicalTypeId::FLOAT:   return SEXTANT_COL_FLOAT;
+		case LogicalTypeId::VARCHAR: return SEXTANT_COL_STRING;
+		case LogicalTypeId::BOOLEAN: return SEXTANT_COL_BOOL;
+		default:                     return -1;
+	}
+}
+
+static bool TryTranslateOneFilter(const TableFilter &filter, const string &col_name, int engine_col_type,
+                                  vector<SextantScanPredicate> &preds, vector<unique_ptr<Expression>> &sql_exprs,
+                                  const ColumnBinding &col_binding, const LogicalType &col_type) {
+	auto colref = make_uniq<BoundColumnRefExpression>(col_name, col_type, col_binding);
+	switch (filter.filter_type) {
+		case TableFilterType::CONSTANT_COMPARISON: {
+			auto &cf = filter.Cast<ConstantFilter>();
+			const int op = EnginePredOp(cf.comparison_type);
+			if (op < 0) {
+				return false;
+			}
+			auto &pred = preds.emplace_back();
+			pred.column = col_name;
+			pred.op = op;
+			if (engine_col_type == SEXTANT_COL_STRING) {
+				if (cf.constant.type().id() != LogicalTypeId::VARCHAR ||
+				    (op != SEXTANT_PRED_EQ && op != SEXTANT_PRED_NEQ)) {
+					return false;
+				}
+				pred.str_value = cf.constant.ToString();
+			} else if (engine_col_type == SEXTANT_COL_BOOL) {
+				if (op != SEXTANT_PRED_EQ && op != SEXTANT_PRED_NEQ) {
+					return false;
+				}
+				Value bv;
+				if (!cf.constant.DefaultTryCastAs(LogicalType::BOOLEAN, bv, nullptr)) {
+					return false;
+				}
+				pred.value = bv.GetValue<bool>() ? 1.0 : 0.0;
+			} else {
+				Value dv;
+				if (!cf.constant.DefaultTryCastAs(LogicalType::DOUBLE, dv, nullptr)) {
+					return false;
+				}
+				pred.value = dv.GetValue<double>();
+			}
+			sql_exprs.push_back(make_uniq<BoundComparisonExpression>(
+			    cf.comparison_type, colref->Copy(),
+			    make_uniq<BoundConstantExpression>(cf.constant)));
+			return true;
+		}
+		case TableFilterType::IN_FILTER: {
+			auto &inf = filter.Cast<InFilter>();
+			if (inf.values.empty()) {
+				return false;
+			}
+			auto &pred = preds.emplace_back();
+			pred.column = col_name;
+			pred.op = SEXTANT_PRED_IN;
+			if (engine_col_type == SEXTANT_COL_STRING) {
+				for (const auto &v : inf.values) {
+					if (v.type().id() != LogicalTypeId::VARCHAR) {
+						return false;
+					}
+					pred.values.push_back(v.ToString());
+				}
+			} else {
+				for (const auto &v : inf.values) {
+					Value dv;
+					if (!v.DefaultTryCastAs(LogicalType::DOUBLE, dv, nullptr)) {
+						return false;
+					}
+					// %.17g roundtrips a double exactly; the engine
+					// parses IN lists back through strtod.
+					char buf[40];
+					snprintf(buf, sizeof(buf), "%.17g", dv.GetValue<double>());
+					pred.values.push_back(buf);
+				}
+			}
+			auto in_expr = make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN, LogicalType::BOOLEAN);
+			in_expr->children.push_back(std::move(colref));
+			for (const auto &v : inf.values) {
+				in_expr->children.push_back(make_uniq<BoundConstantExpression>(v));
+			}
+			sql_exprs.push_back(std::move(in_expr));
+			return true;
+		}
+		case TableFilterType::CONJUNCTION_AND: {
+			auto &and_filter = filter.Cast<ConjunctionAndFilter>();
+			if (and_filter.child_filters.empty()) {
+				return false;
+			}
+			auto conj = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+			for (const auto &child : and_filter.child_filters) {
+				if (!TryTranslateOneFilter(*child, col_name, engine_col_type, preds, conj->children, col_binding,
+				                        col_type)) {
+					return false;
+				}
+			}
+			sql_exprs.push_back(std::move(conj));
+			return true;
+		}
+		default:
+			return false;
+	}
+}
+
+/// Translate every pushed-down table filter into engine predicates (+ the
+/// exact SQL expressions for re-injection). Returns false when any filter
+/// is not translatable.
+static bool TryTranslateTableFilters(LogicalGet &get, DuckTableEntry &table, void *engine_handle,
+                                     vector<SextantScanPredicate> &preds, vector<unique_ptr<Expression>> &sql_exprs) {
+	// Engine filter schema: name -> SEXTANT_COL_*.
+	case_insensitive_map_t<int> engine_cols;
+	const uint32_t n_engine_cols = sextant_index_filter_col_count(engine_handle);
+	for (uint32_t i = 0; i < n_engine_cols; i++) {
+		char name[128];
+		int type = -1;
+		if (sextant_index_filter_col(engine_handle, i, name, sizeof(name), &type) != 0) {			return false;
+		}
+		engine_cols[name] = type;
+	}
+
+	const auto &get_columns = get.GetColumnIds();
+	for (const auto &entry : get.table_filters.filters) {
+		const idx_t storage_col = entry.first;
+		// Resolve the table column (name + type).
+		const auto &columns = table.GetColumns();
+		if (storage_col >= columns.PhysicalColumnCount()) {			return false;
+		}
+		auto &column = columns.GetColumn(PhysicalIndex(storage_col));
+		const string &col_name = column.Name();
+		const auto it = engine_cols.find(col_name);
+		if (it == engine_cols.end()) {			return false; // filter on a non-indexed column
+		}
+		const int engine_type = EngineColType(column.Type());
+		if (engine_type < 0 || engine_type != it->second) {			return false; // schema drift between table and tree
+		}
+		// Find the canonical binding for this column: binding index ==
+		// position in column_ids, in both pruned and unpruned form. The
+		// rewrite clears projection_ids, so the binding is advertised.
+		ColumnBinding col_binding;
+		bool found = false;
+		for (idx_t c = 0; c < get_columns.size(); c++) {
+			if (get_columns[c].GetPrimaryIndex() == storage_col) {
+				col_binding = ColumnBinding(get.table_index, static_cast<column_t>(c));
+				found = true;
+				break;
+			}
+		}
+		if (!found) {			return false;
+		}
+		if (!TryTranslateOneFilter(*entry.second, col_name, engine_type, preds, sql_exprs, col_binding, column.Type())) {			return false;
+		}
+	}
+	return true;
+}
+
+static bool TryRewriteTopN(ClientContext &context, unique_ptr<LogicalOperator> &plan) {	if (plan->type != LogicalOperatorType::LOGICAL_TOP_N) {
 		return false;
 	}
 	auto &top_n = plan->Cast<LogicalTopN>();
@@ -107,9 +294,7 @@ static bool TryRewriteTopN(ClientContext &context, unique_ptr<LogicalOperator> &
 	auto &get = projection.children[0]->Cast<LogicalGet>();
 	if (get.function.name != "seq_scan" || !get.GetTable()) {
 		return false;
-	}
-	if (!get.table_filters.filters.empty() || (get.dynamic_filters && get.dynamic_filters->HasFilters())) {
-		// Filtered ANN search is a separate serving path (filter SQL).
+	}	if (!get.table_filters.filters.empty() && (get.dynamic_filters && get.dynamic_filters->HasFilters())) {
 		return false;
 	}
 
@@ -133,35 +318,47 @@ static bool TryRewriteTopN(ClientContext &context, unique_ptr<LogicalOperator> &
 		}
 		auto &index = index_entry.index->Cast<SextantIndex>();
 		auto handle = index.GetEngineHandle();
-		if (!handle) {
-			continue;
+		if (!handle) {			continue;
 		}
 		// array_distance is euclidean: only valid for L2 trees.
-		if (sextant_index_metric(handle) != SEXTANT_METRIC_L2SQ) {
-			continue;
+		if (sextant_index_metric(handle) != SEXTANT_METRIC_L2SQ) {			continue;
 		}
 		// The index must be over exactly the column the distance
 		// expression references.
-		if (index.GetColumnIds().size() != 1) {
-			continue;
+		if (index.GetColumnIds().size() != 1) {			continue;
 		}
 
 		vector<float> query;
-		// The distance argument must reference the projection's child
-		// (the get) — the binding the projection passes through.
+		// Per-candidate filter translation (all-or-nothing).
+		vector<SextantScanPredicate> preds;
+		vector<unique_ptr<Expression>> filter_exprs;
+		const bool has_filters = !get.table_filters.filters.empty();
+		if (has_filters &&
+		    !TryTranslateTableFilters(get, table, handle, preds, filter_exprs)) {			return false;
+		}		// The distance argument must reference the projection's child
+		// (the get). NOTE: LogicalGet::GetColumnBindings() is pruned by
+		// projection_ids (column-lifetime analyzer), so it can be
+		// shorter than column_ids — probe the canonical per-position
+		// binding for every occurrence of the indexed column as well.
 		const auto &get_bindings = get.GetColumnBindings();
 		const auto &get_columns = get.GetColumnIds();
-		for (idx_t col = 0; col < get_bindings.size(); col++) {
-			if (col >= get_columns.size() ||
-			    get_columns[col].GetPrimaryIndex() != static_cast<idx_t>(index.GetColumnIds()[0])) {
+		for (idx_t col = 0; col < get_columns.size(); col++) {
+			if (get_columns[col].GetPrimaryIndex() != static_cast<idx_t>(index.GetColumnIds()[0])) {
 				continue;
 			}
-			if (!TryMatchDistanceExpression(distance_expr, get_bindings[col], query)) {
+			bool matched = false;
+			if (col < get_bindings.size() && get_bindings[col].column_index == col) {
+				matched = TryMatchDistanceExpression(distance_expr, get_bindings[col], query);
+			}
+			if (!matched) {
+				matched = TryMatchDistanceExpression(
+				    distance_expr, ColumnBinding(get.table_index, static_cast<column_t>(col)), query);
+			}
+			if (!matched) {
 				continue;
 			}
 			const idx_t dim = ArrayType::GetSize(index.logical_types[0]);
-			if (query.size() != dim) {
-				continue;
+			if (query.size() != dim) {				continue;
 			}
 
 			auto bind_data = make_uniq<SextantIndexScanBindData>();
@@ -169,9 +366,29 @@ static bool TryRewriteTopN(ClientContext &context, unique_ptr<LogicalOperator> &
 			bind_data->index = &index;
 			bind_data->query = std::move(query);
 			bind_data->k = top_n.limit;
+			bind_data->predicates = std::move(preds);
+			if (!bind_data->predicates.empty()) {
+				// Overfetch so the exact SQL re-filter above the scan can
+				// still fill k rows when engine/SQL semantics diverge
+				// (NULL filter values are stored as 0/"" in the tree).
+				bind_data->k = top_n.limit * 4 + 64;
+			}
 
-			get.function = GetSextantIndexScanFunction();
-			get.bind_data = std::move(bind_data);
+			if (!filter_exprs.empty()) {
+				// Exact SQL semantics: re-inject the pushed-down filters
+				// between projection and scan (engine predicates only
+				// shape which k the engine considers).
+				auto filter = make_uniq<LogicalFilter>();
+				filter->expressions = std::move(filter_exprs);
+				filter->children.push_back(std::move(projection.children[0]));
+				projection.children[0] = std::move(filter);
+			}
+			get.table_filters.filters.clear();
+			// Advertise every scanned column (filter-only columns were
+			// pruned from the projection by filter_prune; the re-injected
+			// LogicalFilter references them by canonical binding).
+			get.projection_ids.clear();
+			get.function = GetSextantIndexScanFunction();			get.bind_data = std::move(bind_data);
 			// Keep the TopN: the scan emits at most `limit` rows in
 			// engine-distance order, and the TopN re-sorts those few rows
 			// by the exact SQL expression — so the displayed ORDER BY is

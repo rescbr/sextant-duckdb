@@ -68,8 +68,42 @@ static unique_ptr<GlobalTableFunctionState> SextantIndexScanInitGlobal(ClientCon
 	result->row_ids.resize(bind_data.k);
 	vector<float> dists(bind_data.k);
 	char err[512] = {0};
-	const int32_t n = sextant_search(handle, bind_data.query.data(), &opts, result->row_ids.data(),
-	                                 dists.data(), static_cast<uint32_t>(bind_data.k), err, sizeof(err));
+	int32_t n;
+	if (bind_data.predicates.empty()) {
+		n = sextant_search(handle, bind_data.query.data(), &opts, result->row_ids.data(),
+		                   dists.data(), static_cast<uint32_t>(bind_data.k), err, sizeof(err));
+	} else {
+		// Engine predicate view: strings stay owned by the bind data
+		// (alive for the whole query); the IN-list pointer/length
+		// arrays are locals alive across the call.
+		vector<sextant_predicate> preds(bind_data.predicates.size());
+		vector<vector<const char *>> in_ptrs(bind_data.predicates.size());
+		vector<vector<uint32_t>> in_lens(bind_data.predicates.size());
+		for (idx_t p = 0; p < bind_data.predicates.size(); p++) {
+			const auto &src = bind_data.predicates[p];
+			auto &dst = preds[p];
+			dst.column = src.column.c_str();
+			dst.op = src.op;
+			dst.value = src.value;
+			dst.str_value = src.str_value.empty() ? nullptr : src.str_value.c_str();
+			if (!src.values.empty()) {
+				auto &ptrs = in_ptrs[p];
+				auto &lens = in_lens[p];
+				ptrs.reserve(src.values.size());
+				lens.reserve(src.values.size());
+				for (const auto &v : src.values) {
+					ptrs.push_back(v.c_str());
+					lens.push_back(static_cast<uint32_t>(v.size()));
+				}
+				dst.values = ptrs.data();
+				dst.value_lengths = lens.data();
+				dst.n_values = static_cast<uint32_t>(src.values.size());
+			}
+		}
+		n = sextant_search_filtered(handle, bind_data.query.data(), &opts, preds.data(),
+		                            static_cast<uint32_t>(preds.size()), result->row_ids.data(),
+		                            dists.data(), static_cast<uint32_t>(bind_data.k), err, sizeof(err));
+	}
 	if (n < 0) {
 		throw InvalidInputException("Sextant index '%s': search failed: %s", bind_data.index->GetIndexName(),
 		                            err);
