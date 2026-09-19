@@ -21,6 +21,15 @@ SELECT count(*) AS bad FROM (SELECT rowid FROM t ORDER BY array_distance(v, list
 ----
 0
 
+# Near-zero-norm cluster regression: q=0.1's true neighbors are the
+# cluster-0 rows (v ≈ noise only). Before the ||x_hat||^2 sweep bias the
+# raw scan ranked by -q.x_hat (IP surrogate) and buried them behind
+# higher-norm clusters; the rewritten plan must return cluster-0 rows.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.1::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 0
+----
+0
+
 # Same rows as the explicit engine search (set parity, k=50).
 query I
 WITH nat AS (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 50),
