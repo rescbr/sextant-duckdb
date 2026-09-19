@@ -113,6 +113,11 @@ string ImmutableMessage(const string &index_name, const char *what) {
 	       "(index: " + index_name + ")";
 }
 
+/// Outstanding memory_limit restore for the build-statement clamp set in
+/// BuildBind (see there). Non-empty = our 1 GiB clamp is active and this
+/// SQL restores the user's previous setting.
+string g_memory_limit_restore;
+
 } // namespace
 
 //===--------------------------------------------------------------------===//
@@ -243,13 +248,13 @@ struct SextantBindData : public IndexBuildBindData {
 	string payload_col;         // WITH (payload_col = '...'): blob column
 	int64_t build_threads = 0;  // WITH (build_threads = N): engine build threads
 	int64_t staging_bytes = 0;   // WITH (staging_bytes = N): push-staging RAM budget
+	int64_t stage_budget_mb = 0; // WITH (stage_budget_mb = N): cluster staging
 	string metrics_file;         // WITH (metrics_file = '...'): jsonl phase metrics
 	bool metric_ip = false;      // WITH (metric = 'ip'): inner-product tree
 	// WITH (cardinality = '<spec>'): filter-column cardinality tracking.
 	// Default "auto": track during sampling, reject identity-like columns
 	// (tiny match sets then get exact selectivity instead of the uniform
 	// 1/n prior, fixing the probe-budget recall cliff). Grammar:
-	// "on" | "off" | "auto" | comma-separated name[=mode].
 	string cardinality = "auto";
 };
 
@@ -278,10 +283,40 @@ struct SextantLocalState : public IndexBuildLocalState {
 unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &input) {
 	auto &info = input.info;
 
+	// Clamp DuckDB's buffer-manager ceiling for the WHOLE CREATE INDEX
+	// statement, starting at bind time: the generic index plan scans the
+	// indexed column (9 GiB of vectors on the CulturaX corpus) before
+	// our finalize ever runs, and with a high session limit those pages
+	// stay cached — freed pages are not returned to the OS, so peak RSS
+	// is set by this phase (measured 14 GiB process peak vs a 3.6 GiB
+	// live set). A single-pass build derives nothing from cache.
+	// Restored in BuildFinalize; if the statement dies between bind and
+	// finalize the clamp leaks until RESET memory_limit (bounded, and
+	// the next sextant build restores it first via the pending flag).
+	{
+		Connection con(*input.context.db);
+		if (!g_memory_limit_restore.empty()) {
+			(void)con.SendQuery(g_memory_limit_restore);
+			g_memory_limit_restore.clear();
+		}
+		constexpr idx_t kScanMemoryCap = 1ull << 30;
+		const idx_t mem_before = input.context.db->config.options.maximum_memory;
+		if (mem_before == DConstants::INVALID_INDEX || mem_before > kScanMemoryCap) {
+			// NOTE: the SET value needs a unit suffix — a bare byte count
+			// is a parser error, which would silently skip the clamp.
+			if (!con.SendQuery("SET memory_limit='1GiB'")->HasError()) {
+				g_memory_limit_restore = mem_before == DConstants::INVALID_INDEX
+				                                ? "RESET memory_limit"
+				                                : "SET memory_limit='" +
+				                                      to_string((mem_before + (1ull << 20) - 1) >> 20) + "MiB'";
+			}
+		}
+	}
+
 	// Validate options strictly.
 		static const char *const kKnown[] = {"path", "delta_scan", "prebuilt", "filter_cols", "payload_col",
 		                                "build_threads", "staging_bytes", "metrics_file", "metric",
-		                                "cardinality"};
+		                                "cardinality", "stage_budget_mb"};
 	for (const auto &opt : info.options) {
 		bool known = false;
 		for (auto *k : kKnown) {
@@ -361,6 +396,12 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 			                      "comma-separated column[=mode] entries)");
 		}
 	}
+	if (auto sb = info.options.find("stage_budget_mb"); sb != info.options.end()) {
+		bind->stage_budget_mb = sb->second.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+		if (bind->stage_budget_mb < 0) {
+			throw BinderException("sextant stage_budget_mb must be >= 0 (MiB; 0 = engine default)");
+		}
+	}
 	return std::move(bind);
 }
 
@@ -433,6 +474,7 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 			opts.num_threads = static_cast<uint32_t>(bind.build_threads);
 		}
 		opts.staging_bytes = static_cast<uint64_t>(bind.staging_bytes);
+		opts.stage_budget_mb = static_cast<uint64_t>(bind.stage_budget_mb);
 		if (bind.metric_ip) {
 			opts.metric = SEXTANT_METRIC_IP;
 		}
@@ -453,6 +495,10 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 		                  quoted(duck_table.schema.name) + "." + quoted(duck_table.name) + " WHERE " +
 		                  quoted(vec_name) + " IS NOT NULL";
 	}
+
+	// Always captured (not just the builder branch): BuildFinalize's
+	// memory-limit restore needs a Connection even on the prebuilt path.
+	state->context = &input.context;
 
 	return std::move(state);
 }
@@ -490,7 +536,9 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 		// CulturaX corpus, `SET threads=8` before CREATE INDEX cut peak
 		// RSS 6.9 -> 4.0 GiB with no wall-time loss. Capping here with a
 		// nested `SET threads` deadlocks the scheduler (EDEADLK), so
-		// this is documented guidance instead of code.
+		// this is documented guidance instead of code. The buffer-manager
+		// ceiling is clamped for the whole statement at bind time (see
+		// BuildBind) and restored below.
 		auto result = con.SendQuery(gstate.scan_sql);
 		if (result->HasError()) {
 			sextant_build_abort(gstate.builder);
@@ -739,6 +787,15 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 			    index.GetIndexName(), index.GetSidecarPath(), (unsigned long long)tree_rows,
 			    (unsigned long long)index.n_build);
 		}
+	}
+
+	// Restore the user's memory_limit (clamped at bind time). The
+	// Connection from the build branch is out of scope; make a fresh one.
+	if (!g_memory_limit_restore.empty()) {
+		D_ASSERT(gstate.context);
+		Connection con(*gstate.context->db);
+		(void)con.SendQuery(g_memory_limit_restore);
+		g_memory_limit_restore.clear();
 	}
 
 	return std::move(gstate.global_index);
