@@ -377,7 +377,7 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 					                      "(supported: INTEGER, BIGINT, FLOAT, VARCHAR, BOOLEAN)",
 					                      name, col.Type().ToString());
 			}
-			defs.push_back({name.c_str(), t});
+			defs.push_back({name.c_str(), t, /*nullable=*/1});
 			state->filter_types.push_back(t);
 			filter_sql += ", " + quoted(name);
 		}
@@ -468,10 +468,12 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 
 			// Filter columns.
 			vector<const void *> filter_values;
+			vector<const uint8_t *> filter_nulls;
 			vector<vector<int32_t>> i32_bufs;
 			vector<vector<int64_t>> i64_bufs;
 			vector<vector<float>> f32_bufs;
 			vector<vector<uint8_t>> bool_bufs;
+			vector<vector<uint8_t>> null_bufs;
 			vector<sextant_str_values> str_bufs;
 			vector<vector<const char *>> str_ptrs;
 			vector<vector<uint32_t>> str_lens;
@@ -481,6 +483,7 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 			i64_bufs.reserve(n_filters);
 			f32_bufs.reserve(n_filters);
 			bool_bufs.reserve(n_filters);
+			null_bufs.reserve(n_filters);
 			str_bufs.reserve(n_filters);
 			str_ptrs.reserve(n_filters);
 			str_lens.reserve(n_filters);
@@ -491,68 +494,92 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 						i32_bufs.emplace_back();
 						auto &buf = i32_bufs.back();
 						buf.reserve(n);
+						null_bufs.emplace_back();
+						auto &nbuf = null_bufs.back();
+						nbuf.reserve(n);
 						UnifiedVectorFormat fmt;
 						col.ToUnifiedFormat(n, fmt);
 						auto *d = UnifiedVectorFormat::GetData<int32_t>(fmt);
 						for (idx_t r = 0; r < n; r++) {
-							buf.push_back(fmt.validity.RowIsValid(fmt.sel->get_index(r))
-							                  ? d[fmt.sel->get_index(r)] : 0);
+							const bool valid = fmt.validity.RowIsValid(fmt.sel->get_index(r));
+							buf.push_back(valid ? d[fmt.sel->get_index(r)] : 0);
+							nbuf.push_back(valid ? 0 : 1);
 						}
 						filter_values.push_back(buf.data());
+						filter_nulls.push_back(nbuf.data());
 						break;
 					}
 					case SEXTANT_COL_INT64: {
 						i64_bufs.emplace_back();
 						auto &buf = i64_bufs.back();
 						buf.reserve(n);
+						null_bufs.emplace_back();
+						auto &nbuf = null_bufs.back();
+						nbuf.reserve(n);
 						UnifiedVectorFormat fmt;
 						col.ToUnifiedFormat(n, fmt);
 						auto *d = UnifiedVectorFormat::GetData<int64_t>(fmt);
 						for (idx_t r = 0; r < n; r++) {
-							buf.push_back(fmt.validity.RowIsValid(fmt.sel->get_index(r))
-							                  ? d[fmt.sel->get_index(r)] : 0);
+							const bool valid = fmt.validity.RowIsValid(fmt.sel->get_index(r));
+							buf.push_back(valid ? d[fmt.sel->get_index(r)] : 0);
+							nbuf.push_back(valid ? 0 : 1);
 						}
 						filter_values.push_back(buf.data());
+						filter_nulls.push_back(nbuf.data());
 						break;
 					}
 					case SEXTANT_COL_FLOAT: {
 						f32_bufs.emplace_back();
 						auto &buf = f32_bufs.back();
 						buf.reserve(n);
+						null_bufs.emplace_back();
+						auto &nbuf = null_bufs.back();
+						nbuf.reserve(n);
 						UnifiedVectorFormat fmt;
 						col.ToUnifiedFormat(n, fmt);
 						auto *d = UnifiedVectorFormat::GetData<float>(fmt);
 						for (idx_t r = 0; r < n; r++) {
-							buf.push_back(fmt.validity.RowIsValid(fmt.sel->get_index(r))
-							                  ? d[fmt.sel->get_index(r)] : 0.0f);
+							const bool valid = fmt.validity.RowIsValid(fmt.sel->get_index(r));
+							buf.push_back(valid ? d[fmt.sel->get_index(r)] : 0.0f);
+							nbuf.push_back(valid ? 0 : 1);
 						}
 						filter_values.push_back(buf.data());
+						filter_nulls.push_back(nbuf.data());
 						break;
 					}
 					case SEXTANT_COL_BOOL: {
-						// Engine expects 1-byte-per-row 0/1 (NULL maps to 0).
+						// Engine expects 1-byte-per-row 0/1; NULL rows are
+						// flagged through filter_nulls.
 						bool_bufs.emplace_back();
 						auto &buf = bool_bufs.back();
 						buf.reserve(n);
+						null_bufs.emplace_back();
+						auto &nbuf = null_bufs.back();
+						nbuf.reserve(n);
 						UnifiedVectorFormat fmt;
 						col.ToUnifiedFormat(n, fmt);
 						auto *d = UnifiedVectorFormat::GetData<bool>(fmt);
 						for (idx_t r = 0; r < n; r++) {
-							buf.push_back(fmt.validity.RowIsValid(fmt.sel->get_index(r)) &&
-							               d[fmt.sel->get_index(r)] ? 1 : 0);
+							const bool valid = fmt.validity.RowIsValid(fmt.sel->get_index(r));
+							buf.push_back(valid && d[fmt.sel->get_index(r)] ? 1 : 0);
+							nbuf.push_back(valid ? 0 : 1);
 						}
 						filter_values.push_back(buf.data());
+						filter_nulls.push_back(nbuf.data());
 						break;
 					}
 					case SEXTANT_COL_STRING: {
 						str_bufs.emplace_back();
 						str_ptrs.emplace_back();
 						str_lens.emplace_back();
+						null_bufs.emplace_back();
 						auto &sv = str_bufs.back();
 						auto &ptrs = str_ptrs.back();
 						auto &lens = str_lens.back();
+						auto &nbuf = null_bufs.back();
 						ptrs.reserve(n);
 						lens.reserve(n);
+						nbuf.reserve(n);
 						UnifiedVectorFormat fmt;
 						col.ToUnifiedFormat(n, fmt);
 						auto *d = UnifiedVectorFormat::GetData<string_t>(fmt);
@@ -567,14 +594,17 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 								}
 								ptrs.push_back(s.GetData());
 								lens.push_back(s.GetSize());
+								nbuf.push_back(0);
 							} else {
 								ptrs.push_back("");
 								lens.push_back(0);
+								nbuf.push_back(1);
 							}
 						}
 						sv.data = ptrs.data();
 						sv.lengths = lens.data();
 						filter_values.push_back(&sv);
+						filter_nulls.push_back(nbuf.data());
 						break;
 					}
 					default:
@@ -607,9 +637,10 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 			}
 
 			char err[512] = {0};
-			if (sextant_build_push(gstate.builder, vecs, static_cast<uint32_t>(n),
-			                       filter_values.empty() ? nullptr : filter_values.data(), payload_off,
-			                       payload_ptr, err, sizeof(err)) != 0) {
+			if (sextant_build_push_validity(gstate.builder, vecs, static_cast<uint32_t>(n),
+			                                filter_values.empty() ? nullptr : filter_values.data(),
+			                                filter_nulls.empty() ? nullptr : filter_nulls.data(),
+			                                payload_off, payload_ptr, err, sizeof(err)) != 0) {
 				sextant_build_abort(gstate.builder);
 				gstate.builder = nullptr;
 				throw InvalidInputException("Sextant index: build push failed at row %llu: %s",

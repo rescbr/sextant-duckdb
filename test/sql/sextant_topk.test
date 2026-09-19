@@ -110,6 +110,26 @@ SELECT count(*) AS bad FROM (SELECT rowid, category FROM f WHERE category != 'ca
 ----
 0
 
+# IS NULL is served as an engine predicate on nullable trees (no exact
+# re-filter). Recall is approximate like any ANN top-k: every returned
+# row must be a NULL-category row, but the engine may return fewer than
+# all 4 when the probe budget runs out.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM f WHERE category IS NULL ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 500 != 499
+----
+0
+
+query I
+SELECT count(*) >= 1 AND count(*) <= 4 FROM (SELECT count(*) FROM (SELECT rowid FROM f WHERE category IS NULL ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20))
+----
+true
+
+# IS NOT NULL composed with a numeric predicate.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM f WHERE category IS NOT NULL AND year = 2003 ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 10 != 3 OR rowid % 500 = 499
+----
+0
+
 # Bool filter column + BETWEEN-shaped range (GE+LE conjunction).
 statement ok
 CREATE TABLE g AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v, (rowid % 2 = 0) AS even, (rowid % 10)::INTEGER AS dec FROM range(2000) tbl(rowid)
