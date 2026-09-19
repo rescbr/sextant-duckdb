@@ -235,6 +235,7 @@ struct SextantBindData : public IndexBuildBindData {
 	string payload_col;         // WITH (payload_col = '...'): blob column
 	int64_t build_threads = 0;  // WITH (build_threads = N): engine build threads
 	int64_t staging_bytes = 0;   // WITH (staging_bytes = N): push-staging RAM budget
+	string metrics_file;         // WITH (metrics_file = '...'): jsonl phase metrics
 };
 
 struct SextantGlobalState : public IndexBuildGlobalState {
@@ -245,6 +246,8 @@ struct SextantGlobalState : public IndexBuildGlobalState {
 	uint32_t dim = 0;              // vector dimension (ARRAY size)
 	ClientContext *context = nullptr; // for the finalize scan
 	string scan_sql;               // SELECT vec, filters..., payload
+	string metrics_file;           // jsonl metrics path (owns the buffer
+	                               // opts.metrics_path points into)
 	vector<int> filter_types;      // SEXTANT_COL_* per declared filter col
 	bool has_payload = false;
 };
@@ -260,7 +263,7 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 
 	// Validate options strictly.
 		static const char *const kKnown[] = {"path", "delta_scan", "prebuilt", "filter_cols", "payload_col",
-		                                "build_threads", "staging_bytes"};
+		                                "build_threads", "staging_bytes", "metrics_file"};
 	for (const auto &opt : info.options) {
 		bool known = false;
 		for (auto *k : kKnown) {
@@ -319,6 +322,9 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 		if (bind->staging_bytes < 0) {
 			throw BinderException("sextant staging_bytes must be >= 0");
 		}
+	}
+	if (auto mf = info.options.find("metrics_file"); mf != info.options.end()) {
+		bind->metrics_file = mf->second.ToString();
 	}
 	return std::move(bind);
 }
@@ -392,6 +398,8 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 			opts.num_threads = static_cast<uint32_t>(bind.build_threads);
 		}
 		opts.staging_bytes = static_cast<uint64_t>(bind.staging_bytes);
+		state->metrics_file = bind.metrics_file;  // owns the c_str() below
+		opts.metrics_path = state->metrics_file.c_str();
 		char err[512] = {0};
 		state->builder = sextant_build_begin(
 		    &opts, state->dim, defs.empty() ? nullptr : defs.data(),
