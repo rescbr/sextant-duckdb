@@ -13,7 +13,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/sextant_extension.cpp src/sextant_index.cpp src/sextant_optimizer.cpp src/sextant_scan.cpp)
+set(EXTENSION_SOURCES src/sextant_extension.cpp src/sextant_index.cpp src/sextant_index_scan.cpp
+    src/sextant_optimizer.cpp src/sextant_optimize_topk.cpp src/sextant_scan.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

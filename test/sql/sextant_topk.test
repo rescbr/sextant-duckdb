@@ -1,0 +1,62 @@
+# name: test/sql/sextant_topk.test
+# description: ORDER BY array_distance LIMIT k optimizer rewrite -> sextant index scan
+# group: [sql]
+
+require sextant
+
+load __TEST_DIR__/sextant_topk.db
+
+# 8 well-separated clusters (0.3 apart, 0.02 noise), 250 rows each — same
+# fixture as sextant_scan.test so row sets are directly comparable.
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'topk.tree')
+
+# The rewrite serves natural ANN SQL: top-20 for the cluster-3 center
+# must all be cluster-3 rows.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 3
+----
+0
+
+# Same rows as the explicit engine search (set parity, k=50).
+query I
+WITH nat AS (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 50),
+sx AS (SELECT row_id FROM sextant_query('t', 'idx', list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32], 50))
+SELECT count(*) FROM (SELECT rowid FROM nat EXCEPT SELECT row_id::BIGINT FROM sx)
+----
+0
+
+# The kept TopN re-sorts the few result rows by the exact expression:
+# displayed distances ascend exactly.
+query I
+SELECT count(*) AS unordered FROM (SELECT array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) AS d, lag(d) OVER () AS prev FROM (SELECT v FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 50)) WHERE prev IS NOT NULL AND d < prev
+----
+0
+
+# Full-row fetch through the rewrite (all table columns by rowid).
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, v FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 3
+----
+0
+
+# DESC is not rewritten (exact semantics kept) but must still work.
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) DESC LIMIT 20)
+----
+20
+
+# OFFSET (TopN window) is not rewritten but must still work.
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 5 OFFSET 3)
+----
+5
+
+# A predicate on the scan blocks the rewrite (filtered ANN is a
+# separate path); exact semantics kept.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t WHERE rowid % 8 = 3 ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 3
+----
+0

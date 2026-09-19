@@ -2,6 +2,7 @@
 
 #include "sextant_extension.hpp"
 #include "sextant_index.hpp"
+#include "sextant_index_scan.hpp"
 #include "sextant_scan.hpp"
 
 #include "duckdb.hpp"
@@ -40,6 +41,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    static_cast<uint32_t>(std::max<idx_t>(1, db.config.options.maximum_threads)));
 	RegisterSextantIndexType(db);
 	RegisterSextantImmutabilityOptimizer(db);
+	RegisterSextantTopKOptimizer(db);
 	RegisterSextantScanFunction(db);
 }
 
