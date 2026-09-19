@@ -1,0 +1,47 @@
+# name: test/sql/sextant_cardinality.test
+# description: cardinality tracking (default auto) fixes the tiny-match-set recall cliff
+# group: [sql]
+
+require sextant
+
+load __TEST_DIR__/sextant_cardinality.db
+
+# 8 well-separated clusters (0.3 apart, 0.02 noise), 250 rows each; 'tag'
+# has a rare value on exactly 4 rows (rowid 0..3, cluster 0).
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v, CASE WHEN rowid < 4 THEN 'rare' ELSE 'common' END AS tag FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'card.tree', filter_cols = 'tag')
+
+# Tiny match set: with cardinality tracking (auto default) the engine
+# knows tag = 'rare' selects 4/2000 and brute-forces instead of probing
+# with the uniform 1/n prior (which previously returned 2 of 4).
+query I
+SELECT count(*) FROM (SELECT rowid FROM t WHERE tag = 'rare' ORDER BY array_distance(v, list_transform(range(32), j -> 0.1::FLOAT)::FLOAT[32]) LIMIT 10)
+----
+4
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t WHERE tag = 'rare' ORDER BY array_distance(v, list_transform(range(32), j -> 0.1::FLOAT)::FLOAT[32]) LIMIT 10) WHERE rowid >= 4
+----
+0
+
+# Common value still served correctly through the tracked path.
+query I
+SELECT count(*) FROM (SELECT rowid FROM t WHERE tag = 'common' ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 3
+----
+0
+
+# WITH (cardinality = 'off') is accepted and keeps queries correct for
+# common values (the engine falls back to the uniform prior).
+statement ok
+CREATE TABLE s AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v, (rowid % 4)::INTEGER AS grp FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX si ON s USING sextant (v) WITH (path = 'cardoff.tree', filter_cols = 'grp', cardinality = 'off')
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM s WHERE grp = 2 ORDER BY array_distance(v, list_transform(range(32), j -> 0.6::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 2
+----
+0

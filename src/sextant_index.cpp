@@ -245,6 +245,12 @@ struct SextantBindData : public IndexBuildBindData {
 	int64_t staging_bytes = 0;   // WITH (staging_bytes = N): push-staging RAM budget
 	string metrics_file;         // WITH (metrics_file = '...'): jsonl phase metrics
 	bool metric_ip = false;      // WITH (metric = 'ip'): inner-product tree
+	// WITH (cardinality = '<spec>'): filter-column cardinality tracking.
+	// Default "auto": track during sampling, reject identity-like columns
+	// (tiny match sets then get exact selectivity instead of the uniform
+	// 1/n prior, fixing the probe-budget recall cliff). Grammar:
+	// "on" | "off" | "auto" | comma-separated name[=mode].
+	string cardinality = "auto";
 };
 
 struct SextantGlobalState : public IndexBuildGlobalState {
@@ -257,6 +263,8 @@ struct SextantGlobalState : public IndexBuildGlobalState {
 	string scan_sql;               // SELECT vec, filters..., payload
 	string metrics_file;           // jsonl metrics path (owns the buffer
 	                               // opts.metrics_path points into)
+	string cardinality;           // owns the buffer opts.cardinality
+	                               // points into (bind outlives the build)
 	vector<int> filter_types;      // SEXTANT_COL_* per declared filter col
 	bool has_payload = false;
 };
@@ -272,7 +280,8 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 
 	// Validate options strictly.
 		static const char *const kKnown[] = {"path", "delta_scan", "prebuilt", "filter_cols", "payload_col",
-		                                "build_threads", "staging_bytes", "metrics_file", "metric"};
+		                                "build_threads", "staging_bytes", "metrics_file", "metric",
+		                                "cardinality"};
 	for (const auto &opt : info.options) {
 		bool known = false;
 		for (auto *k : kKnown) {
@@ -341,6 +350,15 @@ unique_ptr<IndexBuildBindData> SextantIndex::BuildBind(IndexBuildBindInput &inpu
 			bind->metric_ip = true;
 		} else if (metric != "l2" && metric != "l2sq" && metric != "euclidean") {
 			throw BinderException("sextant metric must be 'l2' (default) or 'ip', got '%s'", metric);
+		}
+	}
+	if (auto c = info.options.find("cardinality"); c != info.options.end()) {
+		bind->cardinality = c->second.ToString();
+		// Loose sanity check; the engine's parser reports precise errors at
+		// build time (a bad spec fails CREATE INDEX with the reason).
+		if (bind->cardinality.find_first_not_of(" \t") == std::string::npos) {
+			throw BinderException("sextant cardinality spec must not be empty (use 'on', 'off', 'auto' or "
+			                      "comma-separated column[=mode] entries)");
 		}
 	}
 	return std::move(bind);
@@ -420,6 +438,8 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 		}
 		state->metrics_file = bind.metrics_file;  // owns the c_str() below
 		opts.metrics_path = state->metrics_file.c_str();
+		state->cardinality = bind.cardinality;    // owns the c_str() below
+		opts.cardinality = state->cardinality.c_str();
 		char err[512] = {0};
 		state->builder = sextant_build_begin(
 		    &opts, state->dim, defs.empty() ? nullptr : defs.data(),
@@ -606,7 +626,13 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 						for (idx_t r = 0; r < n; r++) {
 							const auto i = fmt.sel->get_index(r);
 							if (fmt.validity.RowIsValid(i)) {
-								const auto s = d[i];
+								// REFERENCE, not copy: short strings are
+								// inlined in string_t, and GetData() on a
+								// stack copy would return a pointer into
+								// that copy — every row would then alias
+								// the last string_t's stack slot (all
+								// inline values silently corrupted).
+								const auto &s = d[i];
 								if (s.GetSize() > 65535) {
 									throw InvalidInputException("Sextant index: filter string exceeds 65535 "
 									                            "bytes at row %llu",
