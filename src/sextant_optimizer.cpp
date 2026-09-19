@@ -8,6 +8,7 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
@@ -21,6 +22,23 @@ bool TableHasSextantIndex(TableCatalogEntry &table) {
 	}
 	auto &indexes = table.Cast<DuckTableEntry>().GetStorage().GetDataTableInfo()->GetIndexes();
 	return indexes.DistinctIndexTypes().count(SextantIndex::TYPE_NAME) > 0;
+}
+
+/// True when every sextant index on the table opted into append-only
+/// serving (WITH (delta_scan = true)) — INSERT is then allowed and the
+/// rows are brute-forced past n_build at query time.
+bool TableAllowsAppend(TableCatalogEntry &table) {
+	bool any = false;
+	for (auto &index_entry : table.Cast<DuckTableEntry>().GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
+		if (!index_entry.index || index_entry.index->GetIndexType() != SextantIndex::TYPE_NAME) {
+			continue;
+		}
+		any = true;
+		if (!index_entry.index->Cast<SextantIndex>().GetDeltaScan()) {
+			return false;
+		}
+	}
+	return any;
 }
 
 /// DROP INDEX on an unbound sextant index would bypass BoundIndex::
@@ -50,12 +68,15 @@ void BindIndexesBeforeDropIndex(ClientContext &context, DropInfo &drop) {
 }
 
 void EnforceImmutable(ClientContext &context, LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_DELETE || op.type == LogicalOperatorType::LOGICAL_UPDATE) {
+	if (op.type == LogicalOperatorType::LOGICAL_DELETE || op.type == LogicalOperatorType::LOGICAL_UPDATE ||
+	    op.type == LogicalOperatorType::LOGICAL_INSERT) {
 		TableCatalogEntry *table = nullptr;
 		if (op.type == LogicalOperatorType::LOGICAL_DELETE) {
 			table = &op.Cast<LogicalDelete>().table;
-		} else {
+		} else if (op.type == LogicalOperatorType::LOGICAL_UPDATE) {
 			table = &op.Cast<LogicalUpdate>().table;
+		} else {
+			table = &op.Cast<LogicalInsert>().table;
 		}
 		if (table && table->IsDuckTable()) {
 			// Force-bind lazily-bound indexes first: after a restart the
@@ -65,12 +86,20 @@ void EnforceImmutable(ClientContext &context, LogicalOperator &op) {
 			if (duck_table.GetStorage().GetDataTableInfo()->GetIndexes().HasUnbound()) {
 				duck_table.GetStorage().BindIndexes(context);
 			}
+			// INSERT is allowed on delta_scan indexes (append-only
+			// serving); DELETE/UPDATE never are.
+			if (op.type == LogicalOperatorType::LOGICAL_INSERT && TableAllowsAppend(*table)) {
+				table = nullptr; // no fence for this insert
+			}
 		}
 		if (table && TableHasSextantIndex(*table)) {
 			throw InvalidInputException(
 			    "Immutable sextant index: %s is not supported on table '%s'. Drop and re-create the index "
 			    "(WITH (delta_scan = true) enables append-only serving).",
-			    op.type == LogicalOperatorType::LOGICAL_DELETE ? "DELETE" : "UPDATE", table->name);
+			    op.type == LogicalOperatorType::LOGICAL_DELETE ? "DELETE"
+			    : op.type == LogicalOperatorType::LOGICAL_UPDATE ? "UPDATE"
+			                                                     : "INSERT",
+			    table->name);
 		}
 	} else if (op.type == LogicalOperatorType::LOGICAL_DROP) {
 		auto &info = op.Cast<LogicalSimple>().info;

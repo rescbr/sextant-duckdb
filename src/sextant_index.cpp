@@ -24,7 +24,8 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 namespace {
 
-constexpr uint32_t kSextantMetaMagic = 0x53585431; // "SXT1"
+constexpr uint32_t kSextantMetaMagic = 0x53585431;    // "SXT1"
+constexpr uint32_t kSextantMetaMagicV2 = 0x53585432; // "SXT2" (+delta_scan u8)
 
 // Fixed-size blocks in a FixedSizeAllocator, chained through IndexPointers.
 // Our blob is tiny (path + uuid + n_build), so one block virtually always
@@ -151,6 +152,9 @@ SextantIndex::SextantIndex(const string &name, IndexConstraintType index_constra
 			                      "built sextant .tree sidecar");
 		}
 		sidecar_path = ResolveSidecarPath(db, path_opt->second.GetValue<string>());
+		if (auto ds = options.find("delta_scan"); ds != options.end()) {
+			delta_scan = ds->second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+		}
 		is_dirty = true;
 	}
 }
@@ -681,10 +685,18 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 //===--------------------------------------------------------------------===//
 
 ErrorData SextantIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
+	if (delta_scan) {
+		// Append-only serving: rows past n_build are brute-forced at query
+		// time (sextant_index_scan delta merge); the tree stays untouched.
+		return ErrorData();
+	}
 	return ErrorData(ImmutableMessage(GetIndexName(), "INSERT"));
 }
 
 ErrorData SextantIndex::Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
+	if (delta_scan) {
+		return ErrorData();
+	}
 	return ErrorData(ImmutableMessage(GetIndexName(), "INSERT"));
 }
 
@@ -716,11 +728,11 @@ void SextantIndex::PersistToDisk() {
 	}
 
 	// Blob: [magic u32][path_len u32][path bytes][uuid_len u32][uuid bytes]
-	//       [n_build u64]
+	//       [n_build u64][delta_scan u8 (SXT2 only)]
 	string blob;
-	blob.resize(4 + 4 + sidecar_path.size() + 4 + tree_uuid.size() + 8);
+	blob.resize(4 + 4 + sidecar_path.size() + 4 + tree_uuid.size() + 8 + 1);
 	data_ptr_t p = reinterpret_cast<data_ptr_t>(blob.data());
-	Store<uint32_t>(kSextantMetaMagic, p);
+	Store<uint32_t>(kSextantMetaMagicV2, p);
 	p += 4;
 	Store<uint32_t>(static_cast<uint32_t>(sidecar_path.size()), p);
 	p += 4;
@@ -731,6 +743,8 @@ void SextantIndex::PersistToDisk() {
 	memcpy(p, tree_uuid.data(), tree_uuid.size());
 	p += tree_uuid.size();
 	Store<uint64_t>(static_cast<uint64_t>(n_build), p);
+	p += 8;
+	*p = delta_scan ? 1 : 0;
 
 	MetaWriter writer(*linked_block_allocator, root_block_ptr);
 	writer.ClearCurrentBlock();
@@ -745,9 +759,10 @@ void SextantIndex::LoadFromStorage() {
 
 	uint32_t magic = 0;
 	reader.ReadData(reinterpret_cast<data_ptr_t>(&magic), 4);
-	if (magic != kSextantMetaMagic) {
+	if (magic != kSextantMetaMagic && magic != kSextantMetaMagicV2) {
 		throw InternalException("SextantIndex: metadata blob magic mismatch");
 	}
+	const bool has_delta_flag = magic == kSextantMetaMagicV2;
 
 	uint32_t path_len = 0;
 	reader.ReadData(reinterpret_cast<data_ptr_t>(&path_len), 4);
@@ -762,6 +777,11 @@ void SextantIndex::LoadFromStorage() {
 	uint64_t n = 0;
 	reader.ReadData(reinterpret_cast<data_ptr_t>(&n), 8);
 	n_build = n;
+	if (has_delta_flag) {
+		uint8_t ds = 0;
+		reader.ReadData(reinterpret_cast<data_ptr_t>(&ds), 1);
+		delta_scan = ds != 0;
+	}
 }
 
 IndexStorageInfo SextantIndex::SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) {

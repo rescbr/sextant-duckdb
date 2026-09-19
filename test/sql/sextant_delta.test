@@ -1,0 +1,70 @@
+# name: test/sql/sextant_delta.test
+# description: delta_scan append-only serving (brute-force merge past n_build)
+# group: [sql]
+
+require sextant
+
+load __TEST_DIR__/sextant_delta.db
+
+# 8 well-separated clusters (0.3 apart), 250 rows each — same fixture shape
+# as sextant_topk.test.
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v, (2000 + (rowid % 10))::INTEGER AS year FROM range(2000) tbl(rowid)
+
+# delta_scan is a bare WITH option (1.5.5 folds `= true` poorly).
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'delta.tree', filter_cols = 'year', delta_scan)
+
+# Appends are allowed on delta_scan indexes.
+statement ok
+INSERT INTO t SELECT list_transform(range(32), j -> 0.9::FLOAT + 0.001::FLOAT*((rowid*31+j*7)%5))::FLOAT[32] AS v, 2026::INTEGER AS year FROM range(100) tbl(rowid)
+
+# The top-k rewrite serves the appended rows: the query sits exactly on
+# the inserted cluster, so every result must be a delta row.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid < 2000
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20)
+----
+20
+
+# Predicates apply to delta rows too: year = 2026 exists only in the
+# appended rows.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t WHERE year = 2026 ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid < 2000
+----
+0
+
+# Tree rows still served alongside delta rows: a query far from the
+# delta cluster returns only build rows.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.1::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid >= 2000
+----
+0
+
+# DELETE stays fenced, delta_scan or not.
+statement error
+DELETE FROM t WHERE rowid = 5
+----
+Immutable sextant index: DELETE is not supported
+
+# UPDATE stays fenced.
+statement error
+UPDATE t SET year = 1 WHERE rowid = 5
+----
+Immutable sextant index: UPDATE is not supported
+
+# Without delta_scan, INSERT is rejected at plan time.
+statement ok
+CREATE TABLE s AS SELECT list_transform(range(32), j -> (rowid % 8)::FLOAT*0.3 + j*0.001)::FLOAT[32] AS v FROM range(200) tbl(rowid)
+
+statement ok
+CREATE INDEX si ON s USING sextant (v) WITH (path = 'strict.tree')
+
+statement error
+INSERT INTO s VALUES (list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32])
+----
+Immutable sextant index: INSERT is not supported

@@ -2,6 +2,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/common/types/vector.hpp"
+
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -11,11 +12,224 @@
 #include "sextant_index.hpp"
 #include "sextant_index_scan.hpp"
 
+#include <cmath>
+#include <cstdlib>
+#include <limits>
+
 namespace duckdb {
 
 //-------------------------------------------------------------------------
 // Internal index scan: emitted rows come back in ANN distance order.
 //-------------------------------------------------------------------------
+
+namespace {
+
+/// Evaluate one translated predicate against a delta row with exact SQL
+/// semantics (NULL fails everything except IS NULL). `numeric`/`str` hold
+/// the row's value; `is_null` its NULL flag.
+bool EvalDeltaPredicate(const SextantScanPredicate &p, bool is_null, double numeric, const string &str) {
+	if (is_null) {
+		return p.op == SEXTANT_PRED_IS_NULL;
+	}
+	switch (p.op) {
+		case SEXTANT_PRED_IS_NULL:    return false;
+		case SEXTANT_PRED_IS_NOT_NULL: return true;
+		case SEXTANT_PRED_EQ:         return numeric == p.value;
+		case SEXTANT_PRED_NEQ:        return numeric != p.value;
+		case SEXTANT_PRED_LT:         return numeric <  p.value;
+		case SEXTANT_PRED_LE:         return numeric <= p.value;
+		case SEXTANT_PRED_GT:         return numeric >  p.value;
+		case SEXTANT_PRED_GE:         return numeric >= p.value;
+		case SEXTANT_PRED_IN:
+			for (const auto &v : p.values) {
+				if (std::strtod(v.c_str(), nullptr) == numeric) return true;
+			}
+			return false;
+		default:
+			// String predicates on the string comparand.
+			break;
+	}
+	switch (p.op) {
+		case SEXTANT_PRED_EQ:  return str == p.str_value;
+		case SEXTANT_PRED_NEQ: return str != p.str_value;
+		case SEXTANT_PRED_IN:
+			for (const auto &v : p.values) {
+				if (str == v) return true;
+			}
+			return false;
+		default:
+			return true; // ops the translator never produces
+	}
+}
+
+/// Append-only delta serving: brute-force rows past n_build (DELETE is
+/// fenced, so those row ids are dense and stable), compute squared-L2
+/// distances to the query, apply the translated predicates, and merge the
+/// best candidates into the engine's (rowid, dist) result.
+void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind_data,
+                    vector<uint64_t> &row_ids, vector<float> &dists) {
+	auto &duck_table = *bind_data.table;
+	const idx_t n_build = bind_data.index->GetNBuild();
+	const idx_t total = duck_table.GetStorage().GetTotalRows();
+	if (total <= n_build) {
+		return; // nothing appended since the build
+	}
+
+	// Resolve fetch columns: [vector column, predicate columns...].
+	const idx_t vec_col = bind_data.index->GetColumnIds()[0];
+	vector<StorageIndex> fetch_cols = {StorageIndex(vec_col)};
+	vector<LogicalType> fetch_types;
+	vector<idx_t> pred_col_ids; // index into fetch_cols (1..)
+	{
+		const auto &columns = duck_table.GetColumns();
+		case_insensitive_map_t<idx_t> by_name;
+		for (idx_t c = 0; c < columns.PhysicalColumnCount(); c++) {
+			by_name[columns.GetColumn(PhysicalIndex(c)).Name()] = c;
+		}
+		fetch_types.push_back(columns.GetColumn(PhysicalIndex(vec_col)).Type());
+		for (const auto &pred : bind_data.predicates) {
+			const auto it = by_name.find(pred.column);
+			if (it == by_name.end() || it->second == vec_col) {
+				return; // predicate column vanished: serve tree rows only
+			}
+			pred_col_ids.push_back(fetch_cols.size());
+			fetch_cols.emplace_back(it->second);
+			fetch_types.push_back(columns.GetColumn(PhysicalIndex(it->second)).Type());
+		}
+	}
+
+	auto &transaction = DuckTransaction::Get(context, duck_table.catalog);
+	ColumnFetchState fetch_state;
+	const idx_t dim = bind_data.query.size();
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), fetch_types);
+
+	// Max-heap-style candidate tracking: keep the best `keep` delta rows.
+	const size_t keep = bind_data.k;
+	vector<std::pair<float, uint64_t>> cand;
+	const size_t n_pred = bind_data.predicates.size();
+
+	for (idx_t start = n_build; start < total; start += STANDARD_VECTOR_SIZE) {
+		const idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total - start);
+		Vector row_ids_vec(LogicalType::ROW_TYPE);
+		auto ids = FlatVector::GetData<row_t>(row_ids_vec);
+		for (idx_t i = 0; i < count; i++) {
+			ids[i] = static_cast<row_t>(start + i);
+		}
+		duck_table.GetStorage().Fetch(transaction, chunk, fetch_cols, row_ids_vec, count, fetch_state);
+
+		UnifiedVectorFormat vfmt;
+		chunk.data[0].ToUnifiedFormat(count, vfmt);
+		auto &vec_child = ArrayVector::GetEntry(chunk.data[0]);
+		auto *vecs = FlatVector::GetData<float>(vec_child);
+
+		// Predicate column value caches for this chunk.
+		vector<UnifiedVectorFormat> pfmt(n_pred);
+		for (size_t pi = 0; pi < n_pred; pi++) {
+			chunk.data[pred_col_ids[pi]].ToUnifiedFormat(count, pfmt[pi]);
+		}
+
+		for (idx_t r = 0; r < count; r++) {
+			const auto vi = vfmt.sel->get_index(r);
+			if (!vfmt.validity.RowIsValid(vi)) {
+				continue; // NULL vector: never indexed
+			}
+			// Squared L2 (the engine's L2SQ ranking scale).
+			float d = 0.0f;
+			const float *v = vecs + static_cast<size_t>(vi) * dim;
+			for (idx_t j = 0; j < dim; j++) {
+				const float diff = v[j] - bind_data.query[j];
+				d += diff * diff;
+			}
+
+			bool pass = true;
+			for (size_t pi = 0; pi < n_pred && pass; pi++) {
+				const auto &fmt = pfmt[pi];
+				const auto &ptype = fetch_types[pred_col_ids[pi]];
+				const auto i = fmt.sel->get_index(r);
+				const bool is_null = !fmt.validity.RowIsValid(i);
+				double numeric = 0.0;
+				string str;
+				if (!is_null) {
+					switch (ptype.id()) {
+						case LogicalTypeId::INTEGER:  numeric = UnifiedVectorFormat::GetData<int32_t>(fmt)[i]; break;
+						case LogicalTypeId::BIGINT:   numeric = UnifiedVectorFormat::GetData<int64_t>(fmt)[i]; break;
+						case LogicalTypeId::FLOAT:    numeric = UnifiedVectorFormat::GetData<float>(fmt)[i]; break;
+						case LogicalTypeId::DOUBLE:   numeric = UnifiedVectorFormat::GetData<double>(fmt)[i]; break;
+						case LogicalTypeId::BOOLEAN:  numeric = UnifiedVectorFormat::GetData<bool>(fmt)[i] ? 1 : 0; break;
+						default: {
+							const auto s = UnifiedVectorFormat::GetData<string_t>(fmt)[i];
+							str = s.GetString();
+							break;
+						}
+					}
+				}
+				pass = EvalDeltaPredicate(bind_data.predicates[pi], is_null, numeric, str);
+			}
+			if (!pass) {
+				continue;
+			}
+			cand.emplace_back(d, static_cast<uint64_t>(start + r));
+		}
+	}
+	// Recompute EXACT squared-L2 distances for the engine's rows too:
+	// engine distances are family-specific scores (offset/surrogate
+	// scales), not comparable with the brute-forced values. Fetching the
+	// k <= 144 vectors is cheap.
+	{
+		Vector ids_vec(LogicalType::ROW_TYPE);
+		auto ids = FlatVector::GetData<row_t>(ids_vec);
+		for (size_t i = 0; i < row_ids.size(); i++) {
+			ids[i] = static_cast<row_t>(row_ids[i]);
+		}
+		DataChunk echunk;
+		echunk.Initialize(Allocator::DefaultAllocator(), fetch_types);
+		duck_table.GetStorage().Fetch(transaction, echunk, fetch_cols, ids_vec,
+		                              row_ids.size(), fetch_state);
+		UnifiedVectorFormat efmt;
+		echunk.data[0].ToUnifiedFormat(row_ids.size(), efmt);
+		auto &echild = ArrayVector::GetEntry(echunk.data[0]);
+		auto *evecs = FlatVector::GetData<float>(echild);
+		for (size_t i = 0; i < row_ids.size(); i++) {
+			const auto ei = efmt.sel->get_index(i);
+			if (!efmt.validity.RowIsValid(ei)) {
+				dists[i] = std::numeric_limits<float>::max();
+				continue;
+			}
+			float d = 0.0f;
+			const float *v = evecs + static_cast<size_t>(ei) * dim;
+			for (idx_t j = 0; j < dim; j++) {
+				const float diff = v[j] - bind_data.query[j];
+				d += diff * diff;
+			}
+			dists[i] = d;
+		}
+	}
+
+	std::sort(cand.begin(), cand.end());
+	if (cand.size() > keep) {
+		cand.resize(keep);
+	}
+	// Merge with the engine's results (both ascending distance) and keep
+	// the best `keep` overall.
+	vector<std::pair<float, uint64_t>> merged;
+	for (size_t i = 0; i < row_ids.size(); i++) {
+		merged.emplace_back(dists[i], row_ids[i]);
+	}
+	merged.insert(merged.end(), cand.begin(), cand.end());
+	std::sort(merged.begin(), merged.end());
+	if (merged.size() > keep) {
+		merged.resize(keep);
+	}
+	row_ids.clear();
+	dists.clear();
+	for (const auto &m : merged) {
+		row_ids.push_back(m.second);
+		dists.push_back(m.first);
+	}
+}
+
+} // namespace
 
 struct SextantIndexScanGlobalState : public GlobalTableFunctionState {
 	ColumnFetchState fetch_state;
@@ -109,6 +323,12 @@ static unique_ptr<GlobalTableFunctionState> SextantIndexScanInitGlobal(ClientCon
 		                            err);
 	}
 	result->row_ids.resize(n);
+	dists.resize(n);
+
+	// Append-only delta serving: merge brute-forced rows past n_build.
+	if (bind_data.index->GetDeltaScan()) {
+		MergeDeltaRows(context, bind_data, result->row_ids, dists);
+	}
 
 	result->column_ids.reserve(input.column_indexes.size());
 	for (const auto &column_index : input.column_indexes) {

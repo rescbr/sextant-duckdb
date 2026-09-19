@@ -75,6 +75,12 @@ public:
 	idx_t GetNBuild() const {
 		return n_build;
 	}
+	/// WITH (delta_scan = true): INSERTs are accepted (append-only) and
+	/// served by brute-forcing rowid >= n_build at query time, merged with
+	/// the tree's results. DELETE/UPDATE stay fenced either way.
+	bool GetDeltaScan() const {
+		return delta_scan;
+	}
 	const string &GetSidecarPath() const {
 		return sidecar_path;
 	}
@@ -112,6 +118,7 @@ private:
 	string sidecar_path;  // resolved (absolute) path to the .tree sidecar
 	string tree_uuid;     // 32 lowercase hex chars; empty = pre-UUID tree
 	idx_t n_build = 0;    // table row count at CREATE INDEX time
+	bool delta_scan = false; // WITH (delta_scan = true): append-only serving
 };
 
 /// Register the "sextant" index type on a database instance.
