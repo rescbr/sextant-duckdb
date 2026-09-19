@@ -213,17 +213,21 @@ void SextantIndex::AttachAndVerify() {
 		                            sidecar_path);
 	}
 	const string sidecar_uuid(uuid);
-	engine_handle = handle;  // kept open until CloseHandle()
 
 	if (tree_uuid.empty()) {
 		// First attach: adopt the sidecar's identity.
 		tree_uuid = sidecar_uuid;
 		is_dirty = true;
 	} else if (!sidecar_uuid.empty() && sidecar_uuid != tree_uuid) {
+		sextant_close_index(handle);
 		throw InvalidInputException("Sextant index '%s': sidecar '%s' is tree %s, but the index was created on "
 		                            "tree %s — stale or wrong file. Drop and re-create the index",
 		                            GetIndexName(), sidecar_path, sidecar_uuid, tree_uuid);
 	}
+	// Publish the handle only after the identity check passed: on a
+	// mismatch the caller must NOT be left with a cached handle to the
+	// wrong tree (the optimizer and scan init would use it silently).
+	engine_handle = handle;  // kept open until CloseHandle()
 }
 
 //===--------------------------------------------------------------------===//
@@ -689,6 +693,21 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 	// Attach + verify the sidecar before the index becomes visible.
 	index.AttachAndVerify();
 
+	// Prebuilt attach: the tree must be rowid-identical to the table. A
+	// row-count mismatch skews the delta_scan boundary (rows covered by
+	// neither the tree nor the delta window, or phantom rowids past the
+	// table end), so refuse it up front.
+	if (!gstate.builder) {
+		const uint64_t tree_rows = sextant_index_count(index.engine_handle);
+		if (tree_rows != index.n_build) {
+			throw InvalidInputException(
+			    "Sextant index '%s': prebuilt tree '%s' holds %llu rows but the table has %llu — attach to "
+			    "a table that is rowid-identical to the tree's build input, or re-build the index",
+			    index.GetIndexName(), index.GetSidecarPath(), (unsigned long long)tree_rows,
+			    (unsigned long long)index.n_build);
+		}
+	}
+
 	return std::move(gstate.global_index);
 }
 
@@ -889,13 +908,19 @@ void RegisterSextantIndexType(DatabaseInstance &db) {
 		auto index = make_uniq<SextantIndex>(input.name, input.constraint_type, input.column_ids,
 		                                     input.table_io_manager, input.unbound_expressions, input.db,
 		                                     input.options, input.storage_info, 0);
-		if (input.storage_info.IsValid() && !index->GetSidecarPath().empty()) {
+		if (!index->GetSidecarPath().empty()) {
 			// Tolerate dead sidecars at LOAD time (deleted file, moved
 			// directory, mismatched tree): throwing here wedges every
 			// statement that binds the table catalog — including DROP
 			// INDEX of the broken entry itself, the only way to clean it
 			// up. Defer the failure to actual use (scan bind re-verifies
 			// via AttachAndVerify and reports the precise error).
+			// Runs for BOTH load paths: storage-valid (uuid compare —
+			// catches a swapped sidecar) and WAL replay of CREATE
+			// (tree_uuid still empty — adopt the sidecar's identity so
+			// the checkpointed blob carries it; otherwise every later
+			// load would adopt whatever tree sits at the path and the
+			// uuid guard would be inert).
 			try {
 				index->AttachAndVerify();
 			} catch (const std::exception &e) {

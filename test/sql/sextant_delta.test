@@ -68,3 +68,53 @@ statement error
 INSERT INTO s VALUES (list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32])
 ----
 Immutable sextant index: INSERT is not supported
+
+# Prebuilt attach: the tree must be rowid-identical to the table. The
+# small.tree fixture holds 2000 rows — a table-count mismatch skews the
+# delta boundary (rows covered by neither tree nor delta window, or
+# phantom rowids), so it is refused.
+statement ok
+CREATE TABLE p AS SELECT list_transform(range(32), j -> ((rowid*32+j)%97)::FLOAT)::FLOAT[32] AS v FROM range(1999) tbl(rowid)
+
+statement error
+CREATE INDEX pi ON p USING sextant (v) WITH (path = '__WORKING_DIRECTORY__/test/data/small.tree', prebuilt, delta_scan)
+----
+holds 2000 rows but the table has 1999
+
+statement ok
+DROP TABLE p
+
+statement ok
+CREATE TABLE p AS SELECT list_transform(range(32), j -> ((rowid*32+j)%97)::FLOAT)::FLOAT[32] AS v FROM range(2001) tbl(rowid)
+
+statement error
+CREATE INDEX pi ON p USING sextant (v) WITH (path = '__WORKING_DIRECTORY__/test/data/small.tree', prebuilt, delta_scan)
+----
+holds 2000 rows but the table has 2001
+
+statement ok
+DROP TABLE p
+
+# Matching prebuilt attach + delta_scan: appended rows are served by the
+# brute-force merge (fixture vectors have integer components 0..96, the
+# inserted cluster sits at 0.5 — far from every build row).
+statement ok
+CREATE TABLE p AS SELECT list_transform(range(32), j -> ((rowid*32+j)%97)::FLOAT)::FLOAT[32] AS v FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX pi ON p USING sextant (v) WITH (path = '__WORKING_DIRECTORY__/test/data/small.tree', prebuilt, delta_scan)
+
+statement ok
+INSERT INTO p SELECT list_transform(range(32), j -> 0.5::FLOAT + 0.001::FLOAT*((rowid*31+j*7)%5))::FLOAT[32] AS v FROM range(50) tbl(rowid)
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM p ORDER BY array_distance(v, list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid < 2000
+----
+0
+
+# Build rows are still served: a query matching the table pattern (not
+# present in the delta cluster) returns only tree rows.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM p ORDER BY array_distance(v, list_transform(range(32), j -> ((5*32+j)%97)::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid >= 2000
+----
+0

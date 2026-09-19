@@ -385,7 +385,16 @@ static bool TryRewriteTopN(ClientContext &context, unique_ptr<LogicalOperator> &
 		}
 		auto &index = index_entry.index->Cast<SextantIndex>();
 		auto handle = index.GetEngineHandle();
-		if (!handle) {			continue;
+		if (!handle) {
+			// Unusable sidecar (deleted file, moved directory, mismatched
+			// tree UUID): fail loudly on actual use instead of silently
+			// falling back to the exact path — a swapped tree would
+			// otherwise be invisible. DROP INDEX still works (it never
+			// comes through here).
+			if (index.sidecar_unusable) {
+				throw InvalidInputException(index.sidecar_error);
+			}
+			continue;
 		}
 		// The expression kind must match the tree's metric
 		// (array_distance ↔ L2, array_inner_product ↔ IP).

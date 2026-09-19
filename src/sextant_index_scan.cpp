@@ -71,6 +71,18 @@ void MergeDeltaRows(ClientContext &context, const SextantIndexScanBindData &bind
 	auto &duck_table = *bind_data.table;
 	const idx_t n_build = bind_data.index->GetNBuild();
 	const idx_t total = duck_table.GetStorage().GetTotalRows();
+
+	// Defensive: the recorded build boundary must match the tree's actual
+	// row count (guarded at CREATE INDEX for prebuilt attaches; this
+	// catches a metadata blob desynced from the sidecar).
+	const uint64_t tree_rows = sextant_index_count(bind_data.index->GetEngineHandle());
+	if (tree_rows != n_build) {
+		throw InvalidInputException("Sextant index '%s': tree holds %llu rows but n_build is %llu — drop "
+		                            "and re-create the index",
+		                            bind_data.index->GetIndexName(), (unsigned long long)tree_rows,
+		                            (unsigned long long)n_build);
+	}
+
 	if (total <= n_build) {
 		return; // nothing appended since the build
 	}

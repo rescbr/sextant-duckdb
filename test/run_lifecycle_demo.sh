@@ -35,12 +35,14 @@ echo "== uuid guard: stale tree at the path is rejected =="
 "$DUCKDB" "$WORK/db.duckdb" -c "LOAD sextant; CHECKPOINT;" >/dev/null 2>&1
 "$ENGINE" build-tree --input="${REPO}/test/data/small.fbin" --index="$WORK/other.tree" >/dev/null 2>&1
 cp "$WORK/other.tree" "$WORK/small.tree"
-OUT=$("$DUCKDB" "$WORK/db.duckdb" -c "LOAD sextant; INSERT INTO t SELECT list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32] FROM range(1);" 2>&1 || true)
+# The plan-time INSERT fence fires before the sidecar is re-opened, so
+# exercise the index via the top-k rewrite (scan bind re-verifies).
+OUT=$("$DUCKDB" "$WORK/db.duckdb" -c "LOAD sextant; SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32]) LIMIT 5);" 2>&1 || true)
 echo "$OUT" | grep -q "stale or wrong file" && echo "OK: uuid mismatch rejected" || { echo "FAIL: $OUT"; exit 1; }
 
 echo "== missing sidecar: clear error, db stays usable =="
 rm -f "$WORK/small.tree"
-OUT=$("$DUCKDB" "$WORK/db.duckdb" -c "LOAD sextant; INSERT INTO t SELECT list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32] FROM range(1);" 2>&1 || true)
+OUT=$("$DUCKDB" "$WORK/db.duckdb" -c "LOAD sextant; SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32]) LIMIT 5);" 2>&1 || true)
 echo "$OUT" | grep -q "cannot open sidecar" && echo "OK: missing sidecar reported" || { echo "FAIL: $OUT"; exit 1; }
 N=$("$DUCKDB" "$WORK/db.duckdb" -noheader -list -c "LOAD sextant; SELECT count(*) FROM t;" 2>/dev/null | tail -1)
 [ "$N" = "2000" ] && echo "OK: db still usable" || { echo "FAIL: db unusable"; exit 1; }
