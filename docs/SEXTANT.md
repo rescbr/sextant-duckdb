@@ -157,7 +157,7 @@ loudly at query time with the precise reason rather than silently.
 | Filtered (6 filter shapes incl. LIKE, tiny sets) | **1.000** | **218x** |
 | Inner product (metric='ip') | **1.000** | **39x** |
 
-## Debug function
+## Debug functions
 
 `sextant_query(table, index_name, query_vector, k)` returns
 `(row_id BIGINT, distance FLOAT)` directly from the engine. Parity with
@@ -165,6 +165,23 @@ the rewrite for L2/IP trees and delta serving; **no WHERE predicates** —
 filtered queries must use the SQL top-k form. Distances are engine
 scores (family-specific scale) except on the delta path, where they are
 recomputed exactly.
+
+`sextant_query_batch(table, index_name, query_vectors, k)` answers many
+queries in one engine call — the batch path uses union leaf probing
+(each leaf is scanned once for all queries that need it) and the
+batched scan kernels, so it is much faster per query than repeated
+`sextant_query` calls at serving scale. `query_vectors` is a list of
+numeric array literals (same dimension as the index, up to 65536
+queries); rows are `(query_index BIGINT 1-based, row_id BIGINT,
+distance FLOAT)`. Same contract as `sextant_query`: same tuning SET
+vars, delta serving included, no predicates.
+
+```sql
+SELECT * FROM sextant_query_batch('docs', 'idx',
+    [q1, q2, q3], 10)
+ORDER BY query_index, distance;
+```
+
 
 ## Immutability
 

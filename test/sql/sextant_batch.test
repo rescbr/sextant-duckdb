@@ -1,0 +1,96 @@
+# name: test/sql/sextant_batch.test
+# description: sextant_query_batch — many query vectors in one engine call
+# group: [sql]
+
+require sextant
+
+load __TEST_DIR__/sextant_batch.db
+
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'batch.tree')
+
+# Four cluster-center queries: each returns k rows, all from its own
+# cluster, tagged with 1-based query_index.
+query III
+SELECT query_index, count(*) AS n, count(*) FILTER (row_id % 8 != query_index - 1) AS bad FROM sextant_query_batch('t', 'idx', [list_transform(range(32), j -> 0.0::FLOAT), list_transform(range(32), j -> 0.3::FLOAT), list_transform(range(32), j -> 0.6::FLOAT), list_transform(range(32), j -> 0.9::FLOAT)], 10) GROUP BY query_index ORDER BY query_index
+----
+1	10	0
+2	10	0
+3	10	0
+4	10	0
+
+# Batch results match single-query sextant_query row-for-row (the batched
+# kernel and union probing return identical candidates for one query).
+query I
+SELECT count(*) FROM ((SELECT row_id FROM sextant_query_batch('t', 'idx', [list_transform(range(32), j -> 0.3::FLOAT)], 20)) EXCEPT (SELECT row_id FROM sextant_query('t', 'idx', list_transform(range(32), j -> 0.3::FLOAT)::FLOAT[32], 20)))
+----
+0
+
+# Distances are emitted per row and ascending within each query.
+query I
+SELECT count(*) FROM (SELECT distance, lag(distance) OVER (PARTITION BY query_index ORDER BY distance) AS prev FROM sextant_query_batch('t', 'idx', [list_transform(range(32), j -> 0.0::FLOAT), list_transform(range(32), j -> 0.9::FLOAT)], 20)) WHERE prev IS NOT NULL AND distance < prev
+----
+0
+
+# Session tuning applies to the batch path too.
+statement ok
+SET sextant_exhaustive = true
+
+query II
+SELECT query_index, count(*) FROM sextant_query_batch('t', 'idx', [list_transform(range(32), j -> 0.6::FLOAT)], 20) GROUP BY query_index
+----
+1	20
+
+statement ok
+RESET sextant_exhaustive
+
+# Bind-time validation.
+statement error
+SELECT * FROM sextant_query_batch('t', 'idx', [], 10)
+----
+query_vectors must not be empty
+
+statement error
+SELECT * FROM sextant_query_batch('t', 'idx', [[1.0, 2.0]], 10)
+----
+index dimension is 32 but query 1 has 2 elements
+
+statement error
+SELECT * FROM sextant_query_batch('t', 'idx', [['a']], 10)
+----
+index dimension is 32 but query 1 has 1 elements
+
+statement error
+SELECT * FROM sextant_query_batch('t', 'idx', [list_transform(range(32), j -> 'a')], 10)
+----
+query vector elements must be numeric
+
+statement error
+SELECT * FROM sextant_query_batch('t', 'idx', [list_transform(range(32), j -> 0.0::FLOAT)], 0)
+----
+k must be in [1, 100000]
+
+statement error
+SELECT * FROM sextant_query_batch('t', 'nope', [list_transform(range(32), j -> 0.0::FLOAT)], 10)
+----
+no sextant index named 'nope'
+
+# Delta parity: appended rows are served per query (the inserted cluster
+# sits at 0.9, far from every build row).
+statement ok
+CREATE TABLE d AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX didx ON d USING sextant (v) WITH (path = 'bdelta.tree', delta_scan)
+
+statement ok
+INSERT INTO d SELECT list_transform(range(32), j -> 0.9::FLOAT + 0.001::FLOAT*((rowid*31+j*7)%5))::FLOAT[32] AS v FROM range(100) tbl(rowid)
+
+query III
+SELECT query_index, count(*) AS n, count(*) FILTER (row_id < 2000) AS from_build FROM sextant_query_batch('d', 'didx', [list_transform(range(32), j -> 0.9::FLOAT), list_transform(range(32), j -> 0.89::FLOAT)], 20) GROUP BY query_index ORDER BY query_index
+----
+1	20	0
+2	20	0
