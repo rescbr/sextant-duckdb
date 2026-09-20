@@ -3,9 +3,8 @@
 #
 name: Main Extension Distribution Pipeline
 on:
-  # Disabled: the distribution pipeline cannot see the private
-  # sextant-engine checkout (deploy key is wired for ci.yml only).
-  # Re-enable and integrate when we ship prebuilt extension binaries.
+  push:
+  pull_request:
   workflow_dispatch:
 
 concurrency:
