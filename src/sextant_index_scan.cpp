@@ -197,6 +197,20 @@ void MergeDeltaRows(ClientContext &context, DuckTableEntry &table, SextantIndex 
 						case LogicalTypeId::FLOAT:    numeric = UnifiedVectorFormat::GetData<float>(fmt)[i]; break;
 						case LogicalTypeId::DOUBLE:   numeric = UnifiedVectorFormat::GetData<double>(fmt)[i]; break;
 						case LogicalTypeId::BOOLEAN:  numeric = UnifiedVectorFormat::GetData<bool>(fmt)[i] ? 1 : 0; break;
+						// Epoch encodings matching the tree-side push and the
+						// predicate comparands (see SextantIndex::EngineColType).
+						case LogicalTypeId::DATE:
+							numeric = UnifiedVectorFormat::GetData<int32_t>(fmt)[i]; // days
+							break;
+						case LogicalTypeId::TIMESTAMP:
+							numeric = static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(fmt)[i]);
+							break;
+						case LogicalTypeId::TIMESTAMP_SEC:
+							numeric = static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(fmt)[i]) * 1e6;
+							break;
+						case LogicalTypeId::TIMESTAMP_MS:
+							numeric = static_cast<double>(UnifiedVectorFormat::GetData<int64_t>(fmt)[i]) * 1e3;
+							break;
 						default: {
 							const auto s = UnifiedVectorFormat::GetData<string_t>(fmt)[i];
 							str = s.GetString();

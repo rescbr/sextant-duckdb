@@ -130,3 +130,23 @@ query I
 SELECT count(*) FROM (SELECT row_id FROM sextant_query('p', 'pi', list_transform(range(32), j -> 0.5::FLOAT)::FLOAT[32], 20))
 ----
 20
+
+# Delta rows evaluate date predicates exactly (epoch-encoded brute force).
+statement ok
+CREATE TABLE dd AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v, DATE '2020-01-01' + INTERVAL (rowid % 90) DAY AS d FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX ddidx ON dd USING sextant (v) WITH (path = 'dd.tree', filter_cols = 'd', delta_scan)
+
+statement ok
+INSERT INTO dd SELECT list_transform(range(32), j -> 0.9::FLOAT + 0.001::FLOAT*((rowid*31+j*7)%5))::FLOAT[32] AS v, DATE '2021-01-01' FROM range(100) tbl(rowid)
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, d FROM dd WHERE d = DATE '2021-01-01' ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE d != DATE '2021-01-01'
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM dd WHERE d = DATE '2021-01-01' ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20)
+----
+20

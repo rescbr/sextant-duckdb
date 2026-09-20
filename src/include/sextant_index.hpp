@@ -4,6 +4,7 @@
 #include "duckdb/execution/index/bound_index.hpp"
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
+#include "sextant/sextant_c.h"
 
 #include <atomic>
 #include <mutex>
@@ -87,8 +88,31 @@ public:
 	bool GetDeltaScan() const {
 		return delta_scan;
 	}
-	const string &GetSidecarPath() const {
+const string &GetSidecarPath() const {
 		return sidecar_path;
+	}
+
+	/// DuckDB filter-column type -> engine SEXTANT_COL_*. -1 = unsupported.
+	/// Date/time map to engine INT64 epochs (DATE = days since epoch,
+	/// TIMESTAMP/_S/_MS normalized to µs; TIMESTAMP_NS rejected — ns since
+	/// epoch overflows the double-safe comparison range). DOUBLE maps to
+	/// engine FLOAT (binary32): filter shape stays consistent because the
+	/// engine snaps comparands through the column domain, and the extension
+	/// forces an exact SQL re-filter for DOUBLE columns.
+	static int EngineColType(const LogicalType &t) {
+		switch (t.id()) {
+			case LogicalTypeId::INTEGER:     return SEXTANT_COL_INT32;
+			case LogicalTypeId::BIGINT:      return SEXTANT_COL_INT64;
+			case LogicalTypeId::FLOAT:       return SEXTANT_COL_FLOAT;
+			case LogicalTypeId::VARCHAR:     return SEXTANT_COL_STRING;
+			case LogicalTypeId::BOOLEAN:     return SEXTANT_COL_BOOL;
+			case LogicalTypeId::DATE:        return SEXTANT_COL_INT64;
+			case LogicalTypeId::TIMESTAMP:   return SEXTANT_COL_INT64;
+			case LogicalTypeId::TIMESTAMP_SEC: return SEXTANT_COL_INT64;
+			case LogicalTypeId::TIMESTAMP_MS: return SEXTANT_COL_INT64;
+			case LogicalTypeId::DOUBLE:      return SEXTANT_COL_FLOAT;
+			default:                         return -1;
+		}
 	}
 
 	/// Set when the sidecar could not be opened at catalog-load time

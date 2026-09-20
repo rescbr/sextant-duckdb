@@ -21,7 +21,7 @@ directory). The table must have no uncommitted data at CREATE time.
 |---|---|---|
 | `path` | required | Sidecar `.tree` file (created by the build). |
 | `prebuilt` | off | Attach an existing tree instead of building; the tree must be rowid-identical to the table (row counts must match). |
-| `filter_cols` | none | Comma-separated table columns (INTEGER, BIGINT, FLOAT, VARCHAR, BOOLEAN) indexed for filtered search. |
+| `filter_cols` | none | Comma-separated table columns (INTEGER, BIGINT, FLOAT, DOUBLE, VARCHAR, BOOLEAN, DATE, TIMESTAMP) indexed for filtered search. DATE/TIMESTAMP are stored as exact INT64 epochs (days / µs); DOUBLE is stored as binary32 with an exact SQL re-filter (FLOAT precision shapes the search, SQL decides the result). TIMESTAMP_NS is rejected. |
 | `delta_scan` | off | Append-only serving: INSERT is allowed; rows past the build are brute-forced at query time and merged with the tree's results. DELETE/UPDATE remain rejected. |
 | `metric` | `l2` | `l2` (array_distance) or `ip` (array_inner_product, DESC ordering). |
 | `cardinality` | `auto` | Filter-column value tracking for selectivity: `on` / `off` / `auto` (track, reject identity-like) or per-column `name=mode` lists. Auto fixes tiny-match-set recall at negligible cost (~4MB/1M entries). |

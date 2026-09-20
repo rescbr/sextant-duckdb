@@ -24,6 +24,8 @@
 #include "sextant_index.hpp"
 #include "sextant_index_scan.hpp"
 
+#include <limits>
+
 namespace duckdb {
 
 //------------------------------------------------------------------------------
@@ -119,13 +121,69 @@ static int EnginePredOp(ExpressionType t) {
 }
 
 static int EngineColType(const LogicalType &t) {
+	return SextantIndex::EngineColType(t);
+}
+
+/// True when the DuckDB type maps to engine INT64 through an epoch
+/// encoding (see EngineColType) — predicate constants and build pushes
+/// must use the same encoding.
+static bool IsEpochEncoded(const LogicalType &t) {
 	switch (t.id()) {
-		case LogicalTypeId::INTEGER: return SEXTANT_COL_INT32;
-		case LogicalTypeId::BIGINT:  return SEXTANT_COL_INT64;
-		case LogicalTypeId::FLOAT:   return SEXTANT_COL_FLOAT;
-		case LogicalTypeId::VARCHAR: return SEXTANT_COL_STRING;
-		case LogicalTypeId::BOOLEAN: return SEXTANT_COL_BOOL;
-		default:                     return -1;
+		case LogicalTypeId::DATE:
+		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_SEC:
+		case LogicalTypeId::TIMESTAMP_MS:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/// Convert a SQL filter constant to the numeric comparand the engine
+/// sees: epoch units for date/time columns (DATE days, TIMESTAMP µs),
+/// raw double otherwise. The engine snaps the double into the column's
+/// storage domain at evaluation, mirroring SQL constant casts.
+static double EngineComparand(const Value &constant, const LogicalType &col_type) {
+	switch (col_type.id()) {
+		case LogicalTypeId::DATE: {
+			Value dv;
+			if (constant.type().id() == LogicalTypeId::DATE) {
+				dv = constant;
+			} else if (!constant.DefaultTryCastAs(LogicalType::DATE, dv, nullptr)) {
+				return std::numeric_limits<double>::quiet_NaN();
+			}
+			return static_cast<double>(dv.GetValue<int32_t>()); // days
+		}
+		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_SEC:
+		case LogicalTypeId::TIMESTAMP_MS: {
+			const LogicalType target = col_type.id() == LogicalTypeId::TIMESTAMP_SEC
+		                                ? LogicalType::TIMESTAMP_S
+		                                : (col_type.id() == LogicalTypeId::TIMESTAMP_MS
+			                                       ? LogicalType::TIMESTAMP_MS
+			                                       : LogicalType::TIMESTAMP);
+			Value tv;
+			if (constant.type().id() == LogicalTypeId::TIMESTAMP ||
+			    constant.type().id() == LogicalTypeId::TIMESTAMP_SEC ||
+			    constant.type().id() == LogicalTypeId::TIMESTAMP_MS) {
+				tv = constant;
+			} else if (!constant.DefaultTryCastAs(target, tv, nullptr)) {
+				return std::numeric_limits<double>::quiet_NaN();
+			}
+			const int64_t us = tv.GetValue<int64_t>();
+			switch (col_type.id()) {
+				case LogicalTypeId::TIMESTAMP_SEC:  return static_cast<double>(us * 1000000);
+				case LogicalTypeId::TIMESTAMP_MS: return static_cast<double>(us * 1000);
+				default:                          return static_cast<double>(us);
+			}
+		}
+		default: {
+			Value dv;
+			if (!constant.DefaultTryCastAs(LogicalType::DOUBLE, dv, nullptr)) {
+				return std::numeric_limits<double>::quiet_NaN();
+			}
+			return dv.GetValue<double>();
+		}
 	}
 }
 
@@ -177,14 +235,14 @@ static bool TryTranslateOneFilter(const TableFilter &filter, const string &col_n
 						}
 						pred.values.push_back(values.back().ToString());
 					} else {
-						Value dv;
-						if (!values.back().DefaultTryCastAs(LogicalType::DOUBLE, dv, nullptr)) {
+						const double c = EngineComparand(values.back(), col_type);
+						if (std::isnan(c)) {
 							return false;
 						}
 						// %.17g roundtrips a double exactly; the engine
 						// parses IN lists back through strtod.
 						char buf[40];
-						snprintf(buf, sizeof(buf), "%.17g", dv.GetValue<double>());
+						snprintf(buf, sizeof(buf), "%.17g", c);
 						pred.values.push_back(buf);
 					}
 				}
@@ -241,11 +299,11 @@ static bool TryTranslateOneFilter(const TableFilter &filter, const string &col_n
 				}
 				pred.value = bv.GetValue<bool>() ? 1.0 : 0.0;
 			} else {
-				Value dv;
-				if (!cf.constant.DefaultTryCastAs(LogicalType::DOUBLE, dv, nullptr)) {
+				const double c = EngineComparand(cf.constant, col_type);
+				if (std::isnan(c)) {
 					return false;
 				}
-				pred.value = dv.GetValue<double>();
+				pred.value = c;
 			}
 			sql_exprs.push_back(make_uniq<BoundComparisonExpression>(
 			    cf.comparison_type, colref->Copy(),
@@ -269,14 +327,14 @@ static bool TryTranslateOneFilter(const TableFilter &filter, const string &col_n
 				}
 			} else {
 				for (const auto &v : inf.values) {
-					Value dv;
-					if (!v.DefaultTryCastAs(LogicalType::DOUBLE, dv, nullptr)) {
+					const double c = EngineComparand(v, col_type);
+					if (std::isnan(c)) {
 						return false;
 					}
 					// %.17g roundtrips a double exactly; the engine
 					// parses IN lists back through strtod.
 					char buf[40];
-					snprintf(buf, sizeof(buf), "%.17g", dv.GetValue<double>());
+					snprintf(buf, sizeof(buf), "%.17g", c);
 					pred.values.push_back(buf);
 				}
 			}
@@ -403,6 +461,13 @@ static bool TryTranslateTableFilters(LogicalGet &get, DuckTableEntry &table, voi
 		// NULL divergence (engine 0/"" stand-ins) only exists on legacy
 		// non-nullable tree columns — those still need the exact re-filter.
 		if (!it->second.second) {
+			preds_exact = false;
+		}
+		// DOUBLE columns are stored as engine binary32: the engine's
+		// comparand snapping keeps filter shape consistent, but binary32
+		// cannot distinguish all doubles — the exact SQL re-filter
+		// guarantees correctness.
+		if (column.Type().id() == LogicalTypeId::DOUBLE) {
 			preds_exact = false;
 		}
 		// Find the canonical binding for this column: binding index ==

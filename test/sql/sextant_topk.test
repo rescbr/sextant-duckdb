@@ -167,3 +167,56 @@ query I
 SELECT count(*) FROM (SELECT rowid FROM f WHERE year NOT IN (2000, 2001) ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) ann WHERE rowid IN (SELECT rowid FROM f WHERE year NOT IN (2000, 2001) ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20 OFFSET 0)
 ----
 20
+
+# ---- DATE / TIMESTAMP / DOUBLE filter columns: engine INT64 epochs
+# ---- (DATE days, TIMESTAMP µs) and binary32 DOUBLE with exact re-filter.
+statement ok
+CREATE TABLE dt AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v, DATE '2020-01-01' + INTERVAL (rowid % 90) DAY AS d, TIMESTAMP '2024-06-01 00:00:00' + INTERVAL (rowid % 90) MINUTE AS ts, (rowid % 100)::DOUBLE * 0.1 AS score FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX dtidx ON dt USING sextant (v) WITH (path = 'topk_dt.tree', filter_cols = 'd,ts,score')
+
+# DATE range: every result inside the window.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, d FROM dt WHERE d >= DATE '2020-02-01' AND d < DATE '2020-03-01' ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE d < DATE '2020-02-01' OR d >= DATE '2020-03-01'
+----
+0
+
+# TIMESTAMP lower bound.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, ts FROM dt WHERE ts >= TIMESTAMP '2024-06-01 00:30:00' ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE ts < TIMESTAMP '2024-06-01 00:30:00'
+----
+0
+
+# DOUBLE range (binary32 storage + exact SQL re-filter).
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, score FROM dt WHERE score > 5.0 ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE score <= 5.0
+----
+0
+
+# NOT IN on a DATE column.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, d FROM dt WHERE d NOT IN (DATE '2020-02-01', DATE '2020-02-02') ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE d IN (DATE '2020-02-01', DATE '2020-02-02')
+----
+0
+
+# Recall parity vs the exact path for all three encodings.
+query I
+SELECT count(*) FROM (SELECT rowid FROM dt WHERE d >= DATE '2020-02-01' AND d < DATE '2020-03-01' ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) ann WHERE rowid IN (SELECT rowid FROM dt WHERE d >= DATE '2020-02-01' AND d < DATE '2020-03-01' ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20 OFFSET 0)
+----
+20
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM dt WHERE score > 5.0 ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) ann WHERE rowid IN (SELECT rowid FROM dt WHERE score > 5.0 ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20 OFFSET 0)
+----
+20
+
+# TIMESTAMP_NS is rejected (ns since epoch overflows the double-safe
+# comparison range).
+statement ok
+CREATE TABLE ns AS SELECT list_transform(range(32), j -> (rowid % 8)::FLOAT*0.3 + j*0.001)::FLOAT[32] AS v, now()::TIMESTAMP_NS AS t FROM range(100) tbl(rowid)
+
+statement error
+CREATE INDEX nsidx ON ns USING sextant (v) WITH (path = 'ns.tree', filter_cols = 't')
+----
+Binder Error: sextant filter column 't' has unsupported type

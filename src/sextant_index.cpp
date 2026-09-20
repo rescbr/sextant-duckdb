@@ -280,6 +280,8 @@ struct SextantGlobalState : public IndexBuildGlobalState {
 	string cardinality;           // owns the buffer opts.cardinality
 	                               // points into (bind outlives the build)
 	vector<int> filter_types;      // SEXTANT_COL_* per declared filter col
+	vector<LogicalTypeId> filter_src; // DuckDB source type per filter col
+	                                 // (epoch/DOUBLE encoding at push)
 };
 
 struct SextantLocalState : public IndexBuildLocalState {
@@ -446,20 +448,16 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 		string filter_sql;
 		for (const auto &name : bind.filter_cols) {
 			auto &col = duck_table.GetColumn(name);
-			int t;
-			switch (col.Type().id()) {
-				case LogicalTypeId::INTEGER:  t = SEXTANT_COL_INT32; break;
-				case LogicalTypeId::BIGINT:   t = SEXTANT_COL_INT64; break;
-				case LogicalTypeId::FLOAT:    t = SEXTANT_COL_FLOAT; break;
-				case LogicalTypeId::VARCHAR:  t = SEXTANT_COL_STRING; break;
-				case LogicalTypeId::BOOLEAN:  t = SEXTANT_COL_BOOL; break;
-				default:
-					throw BinderException("sextant filter column '%s' has unsupported type %s "
-					                      "(supported: INTEGER, BIGINT, FLOAT, VARCHAR, BOOLEAN)",
+			const int t = SextantIndex::EngineColType(col.Type());
+			if (t < 0) {
+				throw BinderException("sextant filter column '%s' has unsupported type %s "
+					                      "(supported: INTEGER, BIGINT, FLOAT, DOUBLE, VARCHAR, BOOLEAN, "
+					                      "DATE, TIMESTAMP)",
 					                      name, col.Type().ToString());
 			}
 			defs.push_back({name.c_str(), t, /*nullable=*/1});
 			state->filter_types.push_back(t);
+			state->filter_src.push_back(col.Type().id());
 			filter_sql += ", " + quoted(name);
 		}
 
@@ -607,11 +605,27 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 						nbuf.reserve(n);
 						UnifiedVectorFormat fmt;
 						col.ToUnifiedFormat(n, fmt);
-						auto *d = UnifiedVectorFormat::GetData<int64_t>(fmt);
-						for (idx_t r = 0; r < n; r++) {
-							const bool valid = fmt.validity.RowIsValid(fmt.sel->get_index(r));
-							buf.push_back(valid ? d[fmt.sel->get_index(r)] : 0);
-							nbuf.push_back(valid ? 0 : 1);
+						const LogicalTypeId src = gstate.filter_src[f];
+						if (src == LogicalTypeId::DATE) {
+							// DuckDB stores DATE as int32 days; engine sees int64 days.
+							auto *d = UnifiedVectorFormat::GetData<int32_t>(fmt);
+							for (idx_t r = 0; r < n; r++) {
+								const bool valid = fmt.validity.RowIsValid(fmt.sel->get_index(r));
+								buf.push_back(valid ? static_cast<int64_t>(d[fmt.sel->get_index(r)]) : 0);
+								nbuf.push_back(valid ? 0 : 1);
+							}
+						} else {
+							// BIGINT (µs for TIMESTAMP already) / TIMESTAMP / _S / _MS
+							// stored as int64; normalize _S/_MS to µs.
+							auto *d = UnifiedVectorFormat::GetData<int64_t>(fmt);
+							const int64_t scale = src == LogicalTypeId::TIMESTAMP_SEC
+							                           ? 1000000
+							                           : (src == LogicalTypeId::TIMESTAMP_MS ? 1000 : 1);
+							for (idx_t r = 0; r < n; r++) {
+								const bool valid = fmt.validity.RowIsValid(fmt.sel->get_index(r));
+								buf.push_back(valid ? d[fmt.sel->get_index(r)] * scale : 0);
+								nbuf.push_back(valid ? 0 : 1);
+							}
 						}
 						filter_values.push_back(buf.data());
 						filter_nulls.push_back(nbuf.data());
@@ -626,11 +640,22 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 						nbuf.reserve(n);
 						UnifiedVectorFormat fmt;
 						col.ToUnifiedFormat(n, fmt);
-						auto *d = UnifiedVectorFormat::GetData<float>(fmt);
-						for (idx_t r = 0; r < n; r++) {
-							const bool valid = fmt.validity.RowIsValid(fmt.sel->get_index(r));
-							buf.push_back(valid ? d[fmt.sel->get_index(r)] : 0.0f);
-							nbuf.push_back(valid ? 0 : 1);
+						if (gstate.filter_src[f] == LogicalTypeId::DOUBLE) {
+							// DOUBLE stored as engine binary32 (with an exact SQL
+							// re-filter at query time; see the optimizer).
+							auto *d = UnifiedVectorFormat::GetData<double>(fmt);
+							for (idx_t r = 0; r < n; r++) {
+								const bool valid = fmt.validity.RowIsValid(fmt.sel->get_index(r));
+								buf.push_back(valid ? static_cast<float>(d[fmt.sel->get_index(r)]) : 0.0f);
+								nbuf.push_back(valid ? 0 : 1);
+							}
+						} else {
+							auto *d = UnifiedVectorFormat::GetData<float>(fmt);
+							for (idx_t r = 0; r < n; r++) {
+								const bool valid = fmt.validity.RowIsValid(fmt.sel->get_index(r));
+								buf.push_back(valid ? d[fmt.sel->get_index(r)] : 0.0f);
+								nbuf.push_back(valid ? 0 : 1);
+							}
 						}
 						filter_values.push_back(buf.data());
 						filter_nulls.push_back(nbuf.data());
