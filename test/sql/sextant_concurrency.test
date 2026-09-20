@@ -1,0 +1,90 @@
+# name: test/sql/sextant_concurrency.test
+# description: concurrent scans/inserts over the extension bind, scan and delta-merge paths
+# group: [sql]
+
+require sextant
+
+load __TEST_DIR__/sextant_concurrency.db
+
+# 8 well-separated clusters (0.3 apart), 250 rows each — same fixture
+# shape as sextant_topk.test / sextant_delta.test.
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v, (2000 + (rowid % 10))::INTEGER AS year FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'conc.tree', filter_cols = 'year', delta_scan)
+
+# Reopen the database: the engine handle is gone and only lazily
+# re-attached on first use. Every thread below then races on the same
+# cold attach path (sextant_query bind / scan init / optimizer read).
+restart
+
+# Hammer the lazy attach from 8 connections at once: each iteration
+# binds sextant_query (which attaches + verifies the sidecar) and the
+# top-k rewrite (which reads the shared handle). Threads that lose the
+# attach race must end up with the SAME live handle, not a freed one.
+concurrentloop i 0 8
+
+loop it 0 25
+
+# ANN is approximate: allow up to 2 of the 10 results to come from a
+# neighboring cluster (measured recall on this fixture is ~1.0 but not
+# guaranteed).
+query I
+SELECT (SELECT count(*) FROM (SELECT row_id FROM sextant_query('t', 'idx', list_transform(range(32), j -> 0.05::FLOAT + {i}::FLOAT*0.3)::FLOAT[32], 10)) WHERE row_id % 8 != {i}) <= 2
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM (SELECT rowid FROM t WHERE year >= 2000 ORDER BY array_distance(v, list_transform(range(32), j -> 0.05::FLOAT + {i}::FLOAT*0.3)::FLOAT[32]) LIMIT 10) WHERE rowid % 8 != {i}) <= 2
+----
+true
+
+endloop
+
+endloop
+
+# Mixed load: thread 0 appends batches (delta_scan brute-force merge
+# under concurrent readers), all threads keep querying. Visibility of
+# the appended rows is transaction-timing dependent, so the in-flight
+# assertions only check that answers stay CORRECT (never a wrong
+# row); the delta rows are verified deterministically after the join.
+concurrentloop i 0 8
+
+loop it 0 25
+
+onlyif i=0
+statement ok
+INSERT INTO t SELECT list_transform(range(32), j -> 0.9::FLOAT + 0.001::FLOAT*((rowid*31+j*7+{it})%5))::FLOAT[32] AS v, 2026::INTEGER AS year FROM range(10) tbl(rowid)
+
+query I
+SELECT count(*) FROM (SELECT rowid, year FROM t WHERE year = 2026 ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 10) WHERE year != 2026
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT row_id FROM sextant_query('t', 'idx', list_transform(range(32), j -> 0.05::FLOAT + {i}::FLOAT*0.3)::FLOAT[32], 10)) WHERE row_id % 8 != {i} AND row_id < 2000) <= 2
+----
+true
+
+endloop
+
+endloop
+
+# All 25 batches committed: 2000 build + 250 delta rows.
+query I
+SELECT count(*) FROM t
+----
+2250
+
+# Delta rows are served and dominate a query on their cluster.
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid < 2000
+----
+0
+
+# Concurrency never corrupted the tree: build rows still answer alone.
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.05::FLOAT + 3::FLOAT*0.3)::FLOAT[32]) LIMIT 10) WHERE rowid >= 2000
+----
+0

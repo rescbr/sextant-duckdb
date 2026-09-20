@@ -63,6 +63,11 @@ The optimizer rewrites `ORDER BY array_distance(v, q) LIMIT k` into a
 - **Delta serving**: with `delta_scan`, appended rows are brute-forced
   and merged exactly; predicates apply to delta rows too. Merge cost is
   ~0.25 ms per 1k delta rows (measured to 100k rows).
+- **Concurrency**: searches are safe from multiple connections/threads
+  (8-thread stress over lazy attach, scans and concurrent delta
+  INSERTs is covered by `test/sql/sextant_concurrency.test`; the engine
+  search itself is additionally TSan-verified). The engine handle is
+  attached exactly once per index and never reopened while in use.
 
 DESC ordering (L2), OFFSET, and multiple ORDER BY terms are not
 rewritten; they run through DuckDB's exact path.

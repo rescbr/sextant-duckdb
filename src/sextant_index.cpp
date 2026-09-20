@@ -172,6 +172,7 @@ SextantIndex::~SextantIndex() {
 }
 
 void SextantIndex::CloseHandle() {
+	std::lock_guard<std::mutex> guard(attach_mutex);
 	if (engine_handle) {
 		sextant_close_index(engine_handle);
 		engine_handle = nullptr;
@@ -202,7 +203,16 @@ void SextantIndex::AttachAndVerify() {
 	// index lifetime: one open handle per index entry, shared by all DuckDB
 	// scan threads (sextant_search is thread-safe on a handle — verified
 	// under TSAN by the engine's ConcurrentSearchStress test).
-	CloseHandle();
+	//
+	// Lazy attach races: multiple query threads can reach here on the
+	// same cold index (fresh reopen, handle still null). The mutex makes
+	// attach exactly-once — without it the losing thread's CloseHandle
+	// frees the winner's live handle (use-after-free) and leaks its own.
+	std::lock_guard<std::mutex> guard(attach_mutex);
+	if (engine_handle) {
+		// Already attached and verified for this index lifetime.
+		return;
+	}
 	char err[512] = {0};
 	void *handle = sextant_open_index(sidecar_path.c_str(), err, sizeof(err));
 	if (!handle) {

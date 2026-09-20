@@ -5,6 +5,9 @@
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
 
+#include <atomic>
+#include <mutex>
+
 namespace duckdb {
 
 /// Sextant IVF-tree index (lifecycle spike).
@@ -40,8 +43,11 @@ public:
 	void CloseHandle();
 
 	/// Cached sextant engine handle (one per index entry; searches on it
-	/// are thread-safe). Null until first successful attach.
-	void *engine_handle = nullptr;
+	/// are thread-safe). Null until first successful attach. Atomic so
+	/// the optimizer / scan threads can read it without synchronization
+	/// while a lazy attach is in flight (a torn read there only skips the
+	/// rewrite for that one plan — exact fallback).
+	std::atomic<void *> engine_handle {nullptr};
 
 	// --- maintenance: refuse everything ---
 	ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;
@@ -100,6 +106,12 @@ public:
 	}
 
 private:
+	/// Serializes lazy attach / handle teardown. AttachAndVerify is
+	/// called from query threads (sextant_query bind, scan init) which
+	/// race on a cold index after a database reopen: without the lock,
+	/// the losing thread's CloseHandle() frees the handle the winner
+	/// just published and is searching (use-after-free).
+	mutable std::mutex attach_mutex;
 	/// Serialize (path, uuid, n_build) into the linked-block blob.
 	void PersistToDisk();
 	/// Deserialize the metadata blob (constructor, storage-valid path).
