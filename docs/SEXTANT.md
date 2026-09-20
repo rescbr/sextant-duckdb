@@ -126,6 +126,21 @@ gains little (the admission gate falls back to mmap, never slower);
 repeated/hot queries gain up to ~2x. These bind at the first use of
 each index per database open, so set them before the first query.
 
+**Serving preset** — the combined configuration for a dedicated
+batch-serving session (measured 56 → 184 QPS on CulturaX 2.9M×768,
+256-query batches, warm). Each line trades something specific
+(~0.96 recall, 8 threads × concurrency, ~1.1 GiB engine-owned DRAM
+outside `memory_limit`), so it is an explicit opt-in, never a default:
+
+```sql
+SET sextant_search_threads = 8;
+SET sextant_probe_fraction = 0.25;
+SET sextant_leaf_cache_mb = 1024;
+SET sextant_plane_cache_mb = 128;
+SELECT * FROM sextant_query_batch('docs', 'idx', [q1, q2, ...], 10)
+ORDER BY query_index, distance;
+```
+
 ## Querying
 
 The optimizer rewrites `ORDER BY array_distance(v, q) LIMIT k` into a

@@ -35,6 +35,17 @@ quick decision guide (full recipes in [docs/SEXTANT.md](docs/SEXTANT.md)):
 | One big query is the whole workload and feels slow | `SET sextant_search_threads = 8;` |
 | No symptom | **Use the defaults** (`sextant_rerank = true` stays on — turning it off costs recall for little speed) |
 
+**Serving preset** — max throughput for a dedicated batch-serving session
+(measured 56 → 184 QPS on 2.9M×768; recall drops to ~0.96 — opt in
+explicitly, don't ship it as a default):
+
+```sql
+SET sextant_search_threads = 8;     -- one batch is the whole workload
+SET sextant_probe_fraction = 0.25;  -- ~0.96 recall@10
+SET sextant_leaf_cache_mb = 1024;   -- hot-query workloads; engine-owned DRAM
+SET sextant_plane_cache_mb = 128;   -- (not visible to DuckDB memory_limit)
+```
+
 Full reference for all options and settings:
 [docs/SEXTANT.md](docs/SEXTANT.md).
 
