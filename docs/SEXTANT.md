@@ -177,10 +177,21 @@ distance FLOAT)`. Same contract as `sextant_query`: same tuning SET
 vars, delta serving included, no predicates.
 
 ```sql
+SET sextant_search_threads = 8;   -- fan the batch out (see below)
 SELECT * FROM sextant_query_batch('docs', 'idx',
     [q1, q2, q3], 10)
 ORDER BY query_index, distance;
 ```
+
+Throughput note (measured on CulturaX 2.9M×768, 256 queries, warm):
+per-query cost matches the native C API (the extension adds no
+per-call overhead), and the batch call scales with
+`sextant_search_threads` — 1 thread ≈ 56 QPS, 8 threads ≈ 128 QPS,
+engine-side throughput at 8 threads exceeds the single-query C API
+(union probing + batched kernels). Set it above 1 when a large batch
+is the whole workload, exactly like `sextant_search_threads` guidance
+above.
+
 
 
 ## Immutability
