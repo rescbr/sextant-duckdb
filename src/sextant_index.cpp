@@ -442,8 +442,7 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 		const auto &column_ids = index.GetColumnIds();
 		string vec_name = duck_table.GetColumns().GetColumn(PhysicalIndex(column_ids[0])).Name();
 
-		// Filter columns: name -> type mapping (Bool unsupported by the v1
-		// push contract; Set later).
+		// Filter columns: name -> type mapping.
 		vector<sextant_filter_col_def> defs;
 		string filter_sql;
 		for (const auto &name : bind.filter_cols) {
@@ -451,8 +450,8 @@ unique_ptr<IndexBuildGlobalState> SextantIndex::BuildGlobalInit(IndexBuildInitGl
 			const int t = SextantIndex::EngineColType(col.Type());
 			if (t < 0) {
 				throw BinderException("sextant filter column '%s' has unsupported type %s "
-					                      "(supported: INTEGER, BIGINT, FLOAT, DOUBLE, VARCHAR, BOOLEAN, "
-					                      "DATE, TIMESTAMP)",
+					                      "(supported: INTEGER, BIGINT, FLOAT, DOUBLE, VARCHAR, "
+					                      "VARCHAR[], BOOLEAN, DATE, TIMESTAMP)",
 					                      name, col.Type().ToString());
 			}
 			defs.push_back({name.c_str(), t, /*nullable=*/1});
@@ -564,6 +563,10 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 			vector<sextant_str_values> str_bufs;
 			vector<vector<const char *>> str_ptrs;
 			vector<vector<uint32_t>> str_lens;
+			vector<sextant_set_values> set_bufs;
+			vector<vector<uint32_t>> set_offs;
+			vector<vector<const char *>> set_elems;
+			vector<vector<uint32_t>> set_elem_lens;
 			// Reserve: `filter_values` holds pointers INTO these outer
 			// vectors' storage — reallocation would dangle them.
 			i32_bufs.reserve(n_filters);
@@ -574,6 +577,10 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 			str_bufs.reserve(n_filters);
 			str_ptrs.reserve(n_filters);
 			str_lens.reserve(n_filters);
+			set_bufs.reserve(n_filters);
+			set_offs.reserve(n_filters);
+			set_elems.reserve(n_filters);
+			set_elem_lens.reserve(n_filters);
 			for (idx_t f = 0; f < n_filters; f++) {
 				auto &col = data.data[1 + f];
 				switch (gstate.filter_types[f]) {
@@ -723,6 +730,63 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 						}
 						sv.data = ptrs.data();
 						sv.lengths = lens.data();
+						filter_values.push_back(&sv);
+						filter_nulls.push_back(nbuf.data());
+						break;
+					}
+					case SEXTANT_COL_SET: {
+						// VARCHAR[] -> engine set column: concatenate every
+						// row's elements into one run and describe it via
+						// offsets (NULL lists only flag the null bit).
+						set_bufs.emplace_back();
+						set_offs.emplace_back();
+						set_elems.emplace_back();
+						set_elem_lens.emplace_back();
+						null_bufs.emplace_back();
+						auto &sv = set_bufs.back();
+						auto &offs = set_offs.back();
+						auto &elems = set_elems.back();
+						auto &elens = set_elem_lens.back();
+						auto &nbuf = null_bufs.back();
+						UnifiedVectorFormat fmt;
+						col.ToUnifiedFormat(n, fmt);
+						auto &child = ListVector::GetEntry(col);
+						UnifiedVectorFormat cfmt;
+						child.ToUnifiedFormat(ListVector::GetListSize(col), cfmt);
+						auto *ld = UnifiedVectorFormat::GetData<list_entry_t>(fmt);
+						auto *cd = UnifiedVectorFormat::GetData<string_t>(cfmt);
+						offs.reserve(n + 1);
+						nbuf.reserve(n);
+						uint32_t total_elems = 0;
+						offs.push_back(0);
+						for (idx_t r = 0; r < n; r++) {
+							const auto i = fmt.sel->get_index(r);
+							if (!fmt.validity.RowIsValid(i)) {
+								nbuf.push_back(1);
+								offs.push_back(total_elems);
+								continue;
+							}
+							nbuf.push_back(0);
+							const auto &le = ld[i];
+							for (idx_t e = le.offset; e < le.offset + le.length; e++) {
+								const auto ci = cfmt.sel->get_index(e);
+								// NULL list elements are skipped: set semantics
+								// are membership among strings, and SQL NULL
+								// members never match anyway.
+								if (!cfmt.validity.RowIsValid(ci)) {
+									continue;
+								}
+								// REFERENCE, not copy (inlined strings, see the
+								// STRING case above).
+								elems.push_back(cd[ci].GetData());
+								elens.push_back(cd[ci].GetSize());
+								total_elems++;
+							}
+							offs.push_back(total_elems);
+						}
+						sv.offsets = offs.data();
+						sv.elem_data = elems.data();
+						sv.elem_lengths = elens.data();
 						filter_values.push_back(&sv);
 						filter_nulls.push_back(nbuf.data());
 						break;

@@ -187,6 +187,70 @@ static double EngineComparand(const Value &constant, const LogicalType &col_type
 	}
 }
 
+/// Translate a set-column membership function pushed down as an
+/// ExpressionFilter (DuckDB pushes list_contains / list_has_any /
+/// list_has_all / tags @> [...\] this way — the filter is keyed by the
+/// column, children[1] is the constant). Returns false for shapes we
+/// cannot represent exactly (then the whole rewrite bails to the exact
+/// SQL path). No sql_exprs re-injection is needed: set columns only
+/// exist in nullable trees (the type shipped with nullable support),
+/// so the engine evaluates these with exact SQL semantics.
+static bool TryTranslateSetFunction(const BoundFunctionExpression &fn, const string &col_name,
+                                    vector<SextantScanPredicate> &preds) {
+	if (fn.children.size() != 2) {
+		return false;
+	}
+	// children[0] must be the column itself (canonicalized to a
+	// BoundReference by the filter combiner).
+	const auto c0 = fn.children[0]->GetExpressionClass();
+	if (c0 != ExpressionClass::BOUND_REF && c0 != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	if (fn.children[1]->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+		return false;
+	}
+	const Value &arg = fn.children[1]->Cast<BoundConstantExpression>().value;
+
+	// Scalar element: membership test -> CONTAINS.
+	if (arg.type().id() == LogicalTypeId::VARCHAR) {
+		auto &pred = preds.emplace_back();
+		pred.column = col_name;
+		pred.op = SEXTANT_PRED_CONTAINS;
+		pred.str_value = arg.ToString();
+		return true;
+	}
+	// Constant list: ANY (intersect) or ALL (subset) semantics.
+	if (arg.type().id() != LogicalTypeId::LIST ||
+	    ListType::GetChildType(arg.type()).id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	// `@>` (sublist containment: order-insensitive subset, matching
+	// array_has_all semantics) binds under its operator name.
+	const bool want_any = fn.function.name == "list_has_any" || fn.function.name == "array_has_any";
+	if (!want_any && fn.function.name != "list_has_all" && fn.function.name != "array_has_all" &&
+		    fn.function.name != "@>") {
+		return false; // unknown set function
+	}
+	vector<string> elems;
+	for (const auto &e : ListValue::GetChildren(arg)) {
+		if (e.IsNull()) {
+			continue; // SQL NULL members never match
+		}
+		elems.push_back(e.ToString());
+	}
+	if (elems.empty()) {
+		// list_has_any(tags, []) is always FALSE — not representable
+		// as an engine predicate; bail so the exact path serves it.
+		// list_has_all(tags, []) is vacuously TRUE: nothing to filter.
+		return !want_any;
+	}
+	auto &pred = preds.emplace_back();
+	pred.column = col_name;
+	pred.op = want_any ? SEXTANT_PRED_CONTAINS_ANY : SEXTANT_PRED_CONTAINS_ALL;
+	pred.values = std::move(elems);
+	return true;
+}
+
 static bool TryTranslateOneFilter(const TableFilter &filter, const string &col_name, int engine_col_type,
                                   vector<SextantScanPredicate> &preds, vector<unique_ptr<Expression>> &sql_exprs,
                                   const ColumnBinding &col_binding, const LogicalType &col_type) {
@@ -197,7 +261,17 @@ static bool TryTranslateOneFilter(const TableFilter &filter, const string &col_n
 			// into a generic ExpressionFilter over a BoundReference.
 			// Unwrap the recognizable forms; anything else bails.
 			auto &ef = filter.Cast<ExpressionFilter>();
-			if (!ef.expr || ef.expr->GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) {
+			if (!ef.expr) {
+				return false;
+			}
+			// Set-column membership functions (list_contains, ...).
+			if (ef.expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+				if (engine_col_type != SEXTANT_COL_SET) {
+					return false;
+				}
+				return TryTranslateSetFunction(ef.expr->Cast<BoundFunctionExpression>(), col_name, preds);
+			}
+			if (ef.expr->GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) {
 				return false;
 			}
 			if (ef.expr->GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||

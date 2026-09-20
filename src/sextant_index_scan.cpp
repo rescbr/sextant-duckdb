@@ -26,12 +26,38 @@ namespace {
 
 /// Evaluate one translated predicate against a delta row with exact SQL
 /// semantics (NULL fails everything except IS NULL). `numeric`/`str` hold
-/// the row's value; `is_null` its NULL flag.
-bool EvalDeltaPredicate(const SextantScanPredicate &p, bool is_null, double numeric, const string &str) {
+/// the row's value; `is_null` its NULL flag; `set_vals` the row's VARCHAR[]
+/// elements (set columns; empty when is_null).
+bool EvalDeltaPredicate(const SextantScanPredicate &p, bool is_null, double numeric, const string &str,
+                         const vector<string> &set_vals) {
 	if (is_null) {
 		return p.op == SEXTANT_PRED_IS_NULL;
 	}
 	switch (p.op) {
+		case SEXTANT_PRED_CONTAINS:
+			for (const auto &v : set_vals) {
+				if (v == p.str_value) return true;
+			}
+			return false;
+		case SEXTANT_PRED_CONTAINS_ANY:
+			for (const auto &v : set_vals) {
+				for (const auto &c : p.values) {
+					if (v == c) return true;
+				}
+			}
+			return false;
+		case SEXTANT_PRED_CONTAINS_ALL:
+			for (const auto &c : p.values) {
+				bool found = false;
+				for (const auto &v : set_vals) {
+					if (v == c) {
+						found = true;
+						break;
+					}
+				}
+				if (!found) return false;
+			}
+			return true;
 		case SEXTANT_PRED_IS_NULL:    return false;
 		case SEXTANT_PRED_IS_NOT_NULL: return true;
 		case SEXTANT_PRED_EQ:         return numeric == p.value;
@@ -190,13 +216,30 @@ void MergeDeltaRows(ClientContext &context, DuckTableEntry &table, SextantIndex 
 				const bool is_null = !fmt.validity.RowIsValid(i);
 				double numeric = 0.0;
 				string str;
+				vector<string> set_vals;
 				if (!is_null) {
 					switch (ptype.id()) {
-						case LogicalTypeId::INTEGER:  numeric = UnifiedVectorFormat::GetData<int32_t>(fmt)[i]; break;
-						case LogicalTypeId::BIGINT:   numeric = UnifiedVectorFormat::GetData<int64_t>(fmt)[i]; break;
-						case LogicalTypeId::FLOAT:    numeric = UnifiedVectorFormat::GetData<float>(fmt)[i]; break;
-						case LogicalTypeId::DOUBLE:   numeric = UnifiedVectorFormat::GetData<double>(fmt)[i]; break;
-						case LogicalTypeId::BOOLEAN:  numeric = UnifiedVectorFormat::GetData<bool>(fmt)[i] ? 1 : 0; break;
+					case LogicalTypeId::INTEGER:  numeric = UnifiedVectorFormat::GetData<int32_t>(fmt)[i]; break;
+					case LogicalTypeId::BIGINT:   numeric = UnifiedVectorFormat::GetData<int64_t>(fmt)[i]; break;
+					case LogicalTypeId::FLOAT:    numeric = UnifiedVectorFormat::GetData<float>(fmt)[i]; break;
+					case LogicalTypeId::DOUBLE:   numeric = UnifiedVectorFormat::GetData<double>(fmt)[i]; break;
+					case LogicalTypeId::BOOLEAN:  numeric = UnifiedVectorFormat::GetData<bool>(fmt)[i] ? 1 : 0; break;
+					case LogicalTypeId::LIST: {
+						// VARCHAR[] predicate column: expand the row's
+						// elements (NULL elements never match).
+						auto &le = UnifiedVectorFormat::GetData<list_entry_t>(fmt)[i];
+						auto &child = ListVector::GetEntry(chunk.data[pred_col_ids[pi]]);
+						UnifiedVectorFormat cfmt;
+						child.ToUnifiedFormat(ListVector::GetListSize(chunk.data[pred_col_ids[pi]]), cfmt);
+						auto *cd = UnifiedVectorFormat::GetData<string_t>(cfmt);
+						for (idx_t e = le.offset; e < le.offset + le.length; e++) {
+							const auto ci = cfmt.sel->get_index(e);
+							if (cfmt.validity.RowIsValid(ci)) {
+								set_vals.push_back(cd[ci].GetString());
+							}
+						}
+						break;
+					}
 						// Epoch encodings matching the tree-side push and the
 						// predicate comparands (see SextantIndex::EngineColType).
 						case LogicalTypeId::DATE:
@@ -218,7 +261,7 @@ void MergeDeltaRows(ClientContext &context, DuckTableEntry &table, SextantIndex 
 						}
 					}
 				}
-				pass = EvalDeltaPredicate(predicates[pi], is_null, numeric, str);
+				pass = EvalDeltaPredicate(predicates[pi], is_null, numeric, str, set_vals);
 			}
 			if (!pass) {
 				continue;

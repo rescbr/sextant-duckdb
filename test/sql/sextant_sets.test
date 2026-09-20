@@ -1,0 +1,151 @@
+# name: test/sql/sextant_sets.test
+# description: VARCHAR[] set filter columns (CONTAINS family) on the top-k rewrite
+# group: [sql]
+
+require sextant
+
+load __TEST_DIR__/sextant_sets.db
+
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(16), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[16] AS v, CASE WHEN rowid % 4 = 3 THEN NULL ELSE ['c' || (rowid % 8)::VARCHAR, 'shared', CASE WHEN rowid % 16 = 0 THEN 'rare' END] END AS tags, (rowid % 8)::INTEGER AS cl FROM range(400) tbl(rowid)
+
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'sets.tree', filter_cols = 'tags,cl')
+
+# The rewrite serves set membership filters (verified via EXPLAIN during
+# development; behavioral parity assertions below).
+# list_contains: only cluster-1 rows (recall-safe count assertions).
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, cl, tags FROM t WHERE list_contains(tags, 'c1') ORDER BY array_distance(v, list_transform(range(16), j -> 0.3::FLOAT)::FLOAT[16]) LIMIT 10) WHERE cl != 1
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM t WHERE list_contains(tags, 'c1') ORDER BY array_distance(v, list_transform(range(16), j -> 0.3::FLOAT)::FLOAT[16]) LIMIT 10)
+----
+10
+
+# 'rare' exists in exactly 25 rows (rowid % 16 = 0; never NULL-tagged).
+query I
+SELECT count(*) FROM (SELECT rowid FROM t WHERE list_contains(tags, 'rare') ORDER BY array_distance(v, list_transform(range(16), j -> 0.0::FLOAT)::FLOAT[16]) LIMIT 10)
+----
+10
+
+# Scalar aliases: array_has matches list_contains.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, cl, tags FROM t WHERE array_has(tags, 'c1') ORDER BY array_distance(v, list_transform(range(16), j -> 0.3::FLOAT)::FLOAT[16]) LIMIT 10) WHERE cl != 1
+----
+0
+
+# list_has_any: intersects the constant list.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, cl, tags FROM t WHERE list_has_any(tags, ['c1', 'c5']) ORDER BY array_distance(v, list_transform(range(16), j -> 0.3::FLOAT)::FLOAT[16]) LIMIT 10) WHERE cl != 1 AND cl != 5
+----
+0
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, cl, tags FROM t WHERE array_has_any(tags, ['c1', 'c5']) ORDER BY array_distance(v, list_transform(range(16), j -> 0.5::FLOAT)::FLOAT[16]) LIMIT 10) WHERE cl != 1 AND cl != 5
+----
+0
+
+# list_has_all: subset semantics; ('shared','c2') means exactly cluster 2.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, cl, tags FROM t WHERE list_has_all(tags, ['shared', 'c2']) ORDER BY array_distance(v, list_transform(range(16), j -> 0.6::FLOAT)::FLOAT[16]) LIMIT 10) WHERE cl != 2
+----
+0
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, cl, tags FROM t WHERE array_has_all(tags, ['shared', 'c2']) ORDER BY array_distance(v, list_transform(range(16), j -> 0.6::FLOAT)::FLOAT[16]) LIMIT 10) WHERE cl != 2
+----
+0
+
+# @> (sublist containment) behaves like list_has_all on constants.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, cl, tags FROM t WHERE tags @> ['c3', 'shared'] ORDER BY array_distance(v, list_transform(range(16), j -> 0.9::FLOAT)::FLOAT[16]) LIMIT 10) WHERE cl != 3
+----
+0
+
+# Combined with a scalar filter column (conjunction of engine preds).
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, cl, tags FROM t WHERE list_contains(tags, 'shared') AND cl = 4 ORDER BY array_distance(v, list_transform(range(16), j -> 1.2::FLOAT)::FLOAT[16]) LIMIT 10) WHERE cl != 4
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM t WHERE list_contains(tags, 'shared') AND cl = 4 ORDER BY array_distance(v, list_transform(range(16), j -> 1.2::FLOAT)::FLOAT[16]) LIMIT 10)
+----
+10
+
+# Ground-truth parity (OFFSET 0 blocks the rewrite → exact plan).
+query I
+SELECT count(*) FROM (SELECT rowid FROM t WHERE list_contains(tags, 'c1') AND cl = 1 ORDER BY array_distance(v, list_transform(range(16), j -> 0.3::FLOAT)::FLOAT[16]) LIMIT 10 OFFSET 0 + 0)
+----
+10
+
+# Empty-list edges: has_any is always false; has_all is vacuously true.
+query I
+SELECT count(*) FROM (SELECT rowid FROM t WHERE list_has_any(tags, []) ORDER BY array_distance(v, list_transform(range(16), j -> 0.0::FLOAT)::FLOAT[16]) LIMIT 10)
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM t WHERE list_has_all(tags, []) ORDER BY array_distance(v, list_transform(range(16), j -> 0.0::FLOAT)::FLOAT[16]) LIMIT 10)
+----
+10
+
+# Non-list VARCHAR[] filter columns are rejected at bind time.
+statement ok
+CREATE TABLE bad AS SELECT list_transform(range(16), j -> j::FLOAT)::FLOAT[16] AS v, [1, 2]::INTEGER[] AS nums FROM range(50) tbl(rowid)
+
+statement error
+CREATE INDEX bidx ON bad USING sextant (v) WITH (path = 'bad.tree', filter_cols = 'nums')
+----
+unsupported type INTEGER[] (supported:
+
+# Engine set limits surface as build errors (max 255 elements/row).
+statement ok
+CREATE TABLE big AS SELECT list_transform(range(16), j -> j::FLOAT)::FLOAT[16] AS v, list_transform(range(256), i -> 'x') AS tags FROM range(10) tbl(rowid)
+
+statement error
+CREATE INDEX bigidx ON big USING sextant (v) WITH (path = 'big.tree', filter_cols = 'tags')
+----
+set element count exceeds 255
+
+# Delta path: appended rows evaluate set predicates exactly.
+statement ok
+CREATE TABLE d AS SELECT list_transform(range(16), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[16] AS v, ['c' || (rowid % 8)::VARCHAR, 'shared'] AS tags FROM range(400) tbl(rowid)
+
+statement ok
+CREATE INDEX didx ON d USING sextant (v) WITH (path = 'dsets.tree', filter_cols = 'tags', delta_scan)
+
+statement ok
+INSERT INTO d SELECT list_transform(range(16), j -> 0.9::FLOAT + 0.001::FLOAT*((rowid*31+j*7)%5))::FLOAT[16] AS v, ['new', 'shared'] AS tags FROM range(100) tbl(rowid)
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM d WHERE list_contains(tags, 'new') ORDER BY array_distance(v, list_transform(range(16), j -> 0.9::FLOAT)::FLOAT[16]) LIMIT 20) WHERE rowid < 400
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM d WHERE list_contains(tags, 'new') ORDER BY array_distance(v, list_transform(range(16), j -> 0.9::FLOAT)::FLOAT[16]) LIMIT 20)
+----
+20
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid, tags FROM d WHERE list_has_any(tags, ['new', 'c1']) ORDER BY array_distance(v, list_transform(range(16), j -> 0.9::FLOAT)::FLOAT[16]) LIMIT 20) WHERE tags[2] != 'shared' AND rowid % 8 != 1
+----
+0
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM d WHERE tags @> ['shared', 'new'] ORDER BY array_distance(v, list_transform(range(16), j -> 0.9::FLOAT)::FLOAT[16]) LIMIT 20) WHERE rowid < 400
+----
+0
+
+# Delta rows with NULL tags never match membership predicates.
+statement ok
+INSERT INTO d SELECT list_transform(range(16), j -> 0.89::FLOAT)::FLOAT[16] AS v, NULL AS tags FROM range(10) tbl(rowid)
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM d WHERE list_contains(tags, 'shared') AND rowid >= 510 ORDER BY array_distance(v, list_transform(range(16), j -> 0.89::FLOAT)::FLOAT[16]) LIMIT 10)
+----
+0

@@ -93,7 +93,9 @@ const string &GetSidecarPath() const {
 	}
 
 	/// DuckDB filter-column type -> engine SEXTANT_COL_*. -1 = unsupported.
-	/// Date/time map to engine INT64 epochs (DATE = days since epoch,
+	/// VARCHAR[] (LIST of VARCHAR) maps to the engine set column; the
+	/// CONTAINS predicate family evaluates against it. Date/time map to
+	/// engine INT64 epochs (DATE = days since epoch,
 	/// TIMESTAMP/_S/_MS normalized to µs; TIMESTAMP_NS rejected — ns since
 	/// epoch overflows the double-safe comparison range). DOUBLE maps to
 	/// engine FLOAT (binary32): filter shape stays consistent because the
@@ -111,6 +113,9 @@ const string &GetSidecarPath() const {
 			case LogicalTypeId::TIMESTAMP_SEC: return SEXTANT_COL_INT64;
 			case LogicalTypeId::TIMESTAMP_MS: return SEXTANT_COL_INT64;
 			case LogicalTypeId::DOUBLE:      return SEXTANT_COL_FLOAT;
+			case LogicalTypeId::LIST:
+				// VARCHAR[] only: the engine set column holds strings.
+				return ListType::GetChildType(t) == LogicalType::VARCHAR ? SEXTANT_COL_SET : -1;
 			default:                         return -1;
 		}
 	}

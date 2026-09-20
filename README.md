@@ -1,9 +1,9 @@
 # Sextant DuckDB Extension
 
 IVF-tree ANN index for DuckDB, backed by the sextant engine. Natural
-SQL top-k queries are rewritten to an index scan; filter columns,
-inner-product metric and append-only delta serving are
-supported.
+SQL top-k queries are rewritten to an index scan; filter columns
+(including VARCHAR[] set membership), inner-product metric and
+append-only delta serving are supported.
 
 - Build: `make release` (statically links `../sextant-engine/build-x86`)
 - Test: `make test_release` (sqllogictests)
@@ -18,6 +18,7 @@ CREATE INDEX idx ON docs USING sextant (embedding)
 -- Served by the index (SEXTANT_INDEX_SCAN):
 SELECT * FROM docs
 WHERE language = 'en'
+  AND list_contains(tags, 'release-notes')
 ORDER BY array_distance(embedding, query_vec)
 LIMIT 10;
 ```
