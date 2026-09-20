@@ -54,8 +54,9 @@ The optimizer rewrites `ORDER BY array_distance(v, q) LIMIT k` into a
 
 - **Plain top-k**: `... ORDER BY array_distance(v, q) LIMIT 10`
 - **Filtered**: WHERE predicates on filter columns — `=`, `!=`, `<`,
-  `<=`, `>`, `>=`, `IN`, `BETWEEN`-style ranges, `IS [NOT] NULL`,
-  and `LIKE 'prefix%'` (translated to an engine prefix predicate).
+  `<=`, `>`, `>=`, `IN`, `NOT IN`, `BETWEEN`-style ranges,
+  `IS [NOT] NULL`, and `LIKE 'prefix%'` (translated to an engine
+  prefix predicate).
   SQL NULL semantics are exact on trees built with nullable columns
   (all extension builds since 2026-09-19).
 - **Inner product**: `... ORDER BY array_inner_product(v, q) DESC LIMIT k`

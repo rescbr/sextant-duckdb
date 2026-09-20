@@ -45,6 +45,11 @@ bool EvalDeltaPredicate(const SextantScanPredicate &p, bool is_null, double nume
 				if (std::strtod(v.c_str(), nullptr) == numeric) return true;
 			}
 			return false;
+		case SEXTANT_PRED_NOT_IN:
+			for (const auto &v : p.values) {
+				if (std::strtod(v.c_str(), nullptr) == numeric) return false;
+			}
+			return true;
 		default:
 			// String predicates on the string comparand.
 			break;
@@ -57,6 +62,11 @@ bool EvalDeltaPredicate(const SextantScanPredicate &p, bool is_null, double nume
 				if (str == v) return true;
 			}
 			return false;
+		case SEXTANT_PRED_NOT_IN:
+			for (const auto &v : p.values) {
+				if (str == v) return false;
+			}
+			return true;
 		default:
 			return true; // ops the translator never produces
 	}

@@ -135,25 +135,73 @@ static bool TryTranslateOneFilter(const TableFilter &filter, const string &col_n
 	auto colref = make_uniq<BoundColumnRefExpression>(col_name, col_type, col_binding);
 	switch (filter.filter_type) {
 		case TableFilterType::EXPRESSION_FILTER: {
-			// The filter combiner canonicalizes IS [NOT] NULL into a
-			// generic ExpressionFilter over a BoundReference. Unwrap the
-			// recognizable form; anything else bails.
+			// The filter combiner canonicalizes IS [NOT] NULL and NOT IN
+			// into a generic ExpressionFilter over a BoundReference.
+			// Unwrap the recognizable forms; anything else bails.
 			auto &ef = filter.Cast<ExpressionFilter>();
-			if (!ef.expr || ef.expr->GetExpressionClass() != ExpressionClass::BOUND_OPERATOR ||
-			    (ef.expr->GetExpressionType() != ExpressionType::OPERATOR_IS_NULL &&
-			     ef.expr->GetExpressionType() != ExpressionType::OPERATOR_IS_NOT_NULL)) {
+			if (!ef.expr || ef.expr->GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) {
 				return false;
 			}
-			const bool is_null = ef.expr->GetExpressionType() == ExpressionType::OPERATOR_IS_NULL;
-			auto &pred = preds.emplace_back();
-			pred.column = col_name;
-			pred.op = is_null ? SEXTANT_PRED_IS_NULL : SEXTANT_PRED_IS_NOT_NULL;
-			auto is_expr = make_uniq<BoundOperatorExpression>(
-			    is_null ? ExpressionType::OPERATOR_IS_NULL : ExpressionType::OPERATOR_IS_NOT_NULL,
-			    LogicalType::BOOLEAN);
-			is_expr->children.push_back(std::move(colref));
-			sql_exprs.push_back(std::move(is_expr));
-			return true;
+			if (ef.expr->GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
+			    ef.expr->GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+				const bool is_null = ef.expr->GetExpressionType() == ExpressionType::OPERATOR_IS_NULL;
+				auto &pred = preds.emplace_back();
+				pred.column = col_name;
+				pred.op = is_null ? SEXTANT_PRED_IS_NULL : SEXTANT_PRED_IS_NOT_NULL;
+				auto is_expr = make_uniq<BoundOperatorExpression>(
+				    is_null ? ExpressionType::OPERATOR_IS_NULL : ExpressionType::OPERATOR_IS_NOT_NULL,
+				    LogicalType::BOOLEAN);
+				is_expr->children.push_back(std::move(colref));
+				sql_exprs.push_back(std::move(is_expr));
+				return true;
+			}
+			if (ef.expr->GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+				// `col NOT IN (consts)`: translate to the engine NOT_IN set
+				// predicate (children[0] is the canonicalized BoundReference).
+				auto &op_expr = ef.expr->Cast<BoundOperatorExpression>();
+				if (op_expr.children.size() < 2) {
+					return false;
+				}
+				auto &pred = preds.emplace_back();
+				pred.column = col_name;
+				pred.op = SEXTANT_PRED_NOT_IN;
+				vector<Value> values;
+				for (size_t v = 1; v < op_expr.children.size(); v++) {
+					if (op_expr.children[v]->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+						return false;
+					}
+					values.push_back(op_expr.children[v]->Cast<BoundConstantExpression>().value);
+					if (engine_col_type == SEXTANT_COL_STRING) {
+						if (values.back().type().id() != LogicalTypeId::VARCHAR) {
+							return false;
+						}
+						pred.values.push_back(values.back().ToString());
+					} else {
+						Value dv;
+						if (!values.back().DefaultTryCastAs(LogicalType::DOUBLE, dv, nullptr)) {
+							return false;
+						}
+						// %.17g roundtrips a double exactly; the engine
+						// parses IN lists back through strtod.
+						char buf[40];
+						snprintf(buf, sizeof(buf), "%.17g", dv.GetValue<double>());
+						pred.values.push_back(buf);
+					}
+				}
+				if (pred.values.empty()) {
+					return false;
+				}
+				// Exact re-injection form for legacy (non-nullable) trees.
+				auto not_in_expr = make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_NOT_IN,
+				                                                 LogicalType::BOOLEAN);
+				not_in_expr->children.push_back(std::move(colref));
+				for (auto &v : values) {
+					not_in_expr->children.push_back(make_uniq<BoundConstantExpression>(std::move(v)));
+				}
+				sql_exprs.push_back(std::move(not_in_expr));
+				return true;
+			}
+			return false;
 		}
 		case TableFilterType::IS_NULL:
 		case TableFilterType::IS_NOT_NULL: {
