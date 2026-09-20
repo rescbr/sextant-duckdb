@@ -23,17 +23,17 @@ ORDER BY array_distance(embedding, query_vec)
 LIMIT 10;
 ```
 
-Search tuning (session `SET` variables; the defaults are the measured
-quality-first operating points):
+Search tuning (session `SET` variables). **The defaults are measured
+quality-first operating points — don't tune without a symptom.** The
+quick decision guide (full recipes in [docs/SEXTANT.md](docs/SEXTANT.md)):
 
-```sql
-SET sextant_probe_fraction = 0.25;  -- probe budget (index default 0.5 ≈ 0.99 recall@10;
-                                    --  lower trades recall for speed)
-SET sextant_fastscan_w = 4096;      -- shortlist width (default max(k, 1000))
-SET sextant_rerank = false;         -- skip decoded-distance rerank (default on)
-SET sextant_exhaustive = true;      -- probe every leaf (exact ranking)
-SET sextant_search_threads = 4;     -- within-query scan parallelism (default 1)
-```
+| Symptom | Knob |
+|---|---|
+| Need more QPS, can give up a few points of recall | `SET sextant_probe_fraction = 0.25;` (default 0.5 ≈ 0.99 recall@10; 0.25 ≈ 0.96) |
+| Need exact results / want to measure recall on your data | `SET sextant_exhaustive = true;` (brute-force-equivalent, slow on big corpora) |
+| Fewer than k results under a selective filter | `SET sextant_fastscan_w = 8000;` (W ≳ k / filter pass rate) |
+| One big query is the whole workload and feels slow | `SET sextant_search_threads = 8;` |
+| No symptom | **Use the defaults** (`sextant_rerank = true` stays on — turning it off costs recall for little speed) |
 
 Full reference for all options and settings:
 [docs/SEXTANT.md](docs/SEXTANT.md).

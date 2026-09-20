@@ -48,6 +48,12 @@ Measured (CulturaX): untuned 20 GiB peak -> 5.3 GiB with the clamp;
 
 ### Session settings (SET vars)
 
+All knobs default to the engine's measured operating points; **start
+with the defaults and tune only against an observed symptom** (the
+recipes below). Values are validated when a sextant query runs, and
+the top-k rewrite and the `sextant_query()` debug function share the
+same tuning path.
+
 | Setting | Default | Meaning |
 |---|---|---|
 | `sextant_search_threads` | 1 | Within-query parallel scan threads (0/1 = serial; DuckDB parallelizes across queries). |
@@ -56,8 +62,55 @@ Measured (CulturaX): untuned 20 GiB peak -> 5.3 GiB with the clamp;
 | `sextant_rerank` | true | Rerank the shortlist by decoded distance (the default quality contract; turning it off also drops the adaptive-W cut). |
 | `sextant_exhaustive` | false | Probe every leaf — exact ranking, overrides the probe budget and W. |
 
-Values are validated when a sextant query runs. The top-k rewrite and
-the `sextant_query()` debug function share the same tuning path.
+**"Latency/QPS matters more than the last few points of recall"**
+(serving under load, cheap first-stage retrieval):
+```sql
+SET sextant_probe_fraction = 0.25;  -- ~0.96 recall@10; 0.1 ≈ 0.92-0.94
+```
+This is the main dial. Measured on 100K–1M+ corpora: the default 0.5
+targets ~0.99 recall@10 at half the flat-scan cost; every halving
+buys roughly a proportional scan reduction at a known recall cost.
+If you don't know your recall target, measure first (below) — don't
+tune blind.
+
+**"Results must be exact"** (ground truth, debugging, recall
+measurement, or tiny tables where exactness is affordable):
+```sql
+SET sextant_exhaustive = true;
+```
+Probes every leaf and ranks exactly — the output is identical to a
+brute-force sort. Use it to compute your recall baseline against your
+own workload, then pick the smallest `sextant_probe_fraction` that
+holds the recall you need. On large corpora it is a full scan:
+expect it to be slow.
+
+**"Top-k comes back thinner than k under heavy filtering"**
+(selective predicates reject most of the shortlist, e.g. rare
+`language = 'ja'` or `list_contains` on a rare tag):
+```sql
+SET sextant_fastscan_w = 8000;  -- widen the shortlist
+```
+Candidates rejected by filters never enter the ranking; a shortlist
+of W can return at most W-filtered rows. Rule of thumb: W ≳ k /
+predicate pass rate (a predicate passing ~1% of rows with k = 100
+wants W ≳ 10000). Also raise W when k itself is large (k near/above
+the 1000 default).
+
+**"One expensive query feels slow, and it's the only query running"**
+(large k, wide probe budget, or heavy filtering; DuckDB has nothing
+else to parallelize across):
+```sql
+SET sextant_search_threads = 8;
+```
+Spreads one query's leaf scans across threads. Leave at 1 for
+concurrent workloads — DuckDB already parallelizes across queries,
+and per-query fan-out then oversubscribes.
+
+**`sextant_rerank = false`** is the one knob with no common use case:
+it skips the decoded-distance rerank for raw speed, but the fastscan
+scores rank lossily (up to -25pp recall on flat codes) and it also
+disables the adaptive-W cut. Reach for it only if you have measured
+that rerank dominates latency and you accept approximate ordering.
 
 ## Querying
 
