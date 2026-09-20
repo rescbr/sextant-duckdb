@@ -115,3 +115,36 @@ sextant_fastscan_w must be in [0, 2^32)
 
 statement ok
 RESET sextant_fastscan_w
+
+# Engine-owned W-TinyLFU caches: accepted, transparent to results, and
+# validated at index use (binding happens at first attach per session).
+statement ok
+SET sextant_leaf_cache_mb = 256
+
+statement ok
+SET sextant_plane_cache_mb = 64
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20)
+----
+20
+
+# Invalid values fail at the next ATTACH. 'idx' above is already
+# attached (and ignores later changes), so exercise a fresh index:
+# BuildFinalize reads the budget when attaching the new sidecar.
+statement ok
+SET sextant_leaf_cache_mb = -5
+
+statement ok
+CREATE TABLE ct AS SELECT list_transform(range(32), j -> j::FLOAT)::FLOAT[32] AS v FROM range(100) tbl(rowid)
+
+statement error
+CREATE INDEX ctidx ON ct USING sextant (v) WITH (path = 'ct.tree')
+----
+sextant_leaf_cache_mb must be in [0, 2^20] MiB
+
+statement ok
+RESET sextant_leaf_cache_mb
+
+statement ok
+CREATE INDEX ctidx ON ct USING sextant (v) WITH (path = 'ct.tree')

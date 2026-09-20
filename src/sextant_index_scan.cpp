@@ -100,6 +100,31 @@ bool EvalDeltaPredicate(const SextantScanPredicate &p, bool is_null, double nume
 
 } // namespace
 
+/// Engine-owned W-TinyLFU cache budgets (MiB) from the session settings.
+/// Validated here so an invalid value fails at attach with a clear
+/// message. Binds at FIRST attach per index lifetime; later session
+/// changes do not re-open an attached handle.
+std::pair<uint64_t, uint64_t> SextantCacheBudget(ClientContext &context) {
+	uint64_t leaf = 0, plane = 0;
+	Value v;
+	constexpr uint64_t kMaxMiB = 1ull << 20; // 1 PiB: sanity, not policy
+	if (context.TryGetCurrentSetting("sextant_leaf_cache_mb", v)) {
+		const int64_t mb = v.GetValue<int64_t>();
+		if (mb < 0 || mb > static_cast<int64_t>(kMaxMiB)) {
+			throw InvalidInputException("sextant_leaf_cache_mb must be in [0, 2^20] MiB");
+		}
+		leaf = static_cast<uint64_t>(mb) << 20;
+	}
+	if (context.TryGetCurrentSetting("sextant_plane_cache_mb", v)) {
+		const int64_t mb = v.GetValue<int64_t>();
+		if (mb < 0 || mb > static_cast<int64_t>(kMaxMiB)) {
+			throw InvalidInputException("sextant_plane_cache_mb must be in [0, 2^20] MiB");
+		}
+		plane = static_cast<uint64_t>(mb) << 20;
+	}
+	return {leaf, plane};
+}
+
 void ApplySextantSearchSettings(ClientContext &context, void *engine_handle, sextant_search_opts &opts) {
 	Value v;
 	// Per-query within-query parallelism (default 1: DuckDB supplies
@@ -389,7 +414,8 @@ static unique_ptr<GlobalTableFunctionState> SextantIndexScanInitGlobal(ClientCon
 
 	auto handle = bind_data.index->GetEngineHandle();
 	if (!handle) {
-		bind_data.index->AttachAndVerify();
+		auto [leaf_mb, plane_mb] = SextantCacheBudget(context);
+		bind_data.index->AttachAndVerify(leaf_mb, plane_mb);
 		handle = bind_data.index->GetEngineHandle();
 		if (!handle) {
 			throw InvalidInputException("Sextant index '%s': index handle unavailable",

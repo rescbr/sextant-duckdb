@@ -16,6 +16,11 @@ struct DuckTableEntry;
 /// index code size for the adaptive-W tau default (CLI AUTO parity).
 void ApplySextantSearchSettings(ClientContext &context, void *engine_handle, sextant_search_opts &opts);
 
+/// Engine-owned W-TinyLFU cache budgets in BYTES (leaf, plane) from the
+/// sextant_leaf_cache_mb / sextant_plane_cache_mb session settings.
+/// Throws on invalid values; binds at first index attach per session.
+std::pair<uint64_t, uint64_t> SextantCacheBudget(ClientContext &context);
+
 /// One engine predicate translated from the plan's pushed-down table
 /// filters (WHERE clauses). Storage is self-contained so the engine
 /// sextant_predicate view can point into it for the duration of the

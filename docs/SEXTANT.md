@@ -61,6 +61,8 @@ same tuning path.
 | `sextant_fastscan_w` | 0 (engine default) | Shortlist width (engine default = max(k, 1000)). |
 | `sextant_rerank` | true | Rerank the shortlist by decoded distance (the default quality contract; turning it off also drops the adaptive-W cut). |
 | `sextant_exhaustive` | false | Probe every leaf — exact ranking, overrides the probe budget and W. |
+| `sextant_leaf_cache_mb` | 0 (off) | DRAM budget (MiB) for the engine's leaf-extent W-TinyLFU cache. Binds at the **first attach of each index per database open** — set it before first use; mid-session changes do not re-open an attached handle. Never slower than mmap at any size; pays off when the hot leaf set fits (repeated/hot query workloads — measured ~17% on a repeated uniform batch, up to ~2x on hot query distributions). |
+| `sextant_plane_cache_mb` | 0 (off) | Same, for the routing-plane cache. Same binding rules. |
 
 **"Latency/QPS matters more than the last few points of recall"**
 (serving under load, cheap first-stage retrieval):
@@ -111,6 +113,18 @@ it skips the decoded-distance rerank for raw speed, but the fastscan
 scores rank lossily (up to -25pp recall on flat codes) and it also
 disables the adaptive-W cut. Reach for it only if you have measured
 that rerank dominates latency and you accept approximate ordering.
+
+**"Serving the same corpus repeatedly, DRAM to spare"** (hot query
+distributions, e.g. RAG with recurring query themes):
+```sql
+SET sextant_leaf_cache_mb = 1024;  -- engine-owned W-TinyLFU leaf cache
+SET sextant_plane_cache_mb = 128;
+```
+Rule of thumb: size the leaf cache to the *hot* leaf set, not the
+tree — a uniform-random workload over a corpus larger than the cache
+gains little (the admission gate falls back to mmap, never slower);
+repeated/hot queries gain up to ~2x. These bind at the first use of
+each index per database open, so set them before the first query.
 
 ## Querying
 

@@ -1,4 +1,5 @@
 #include "sextant_index.hpp"
+#include "sextant_index_scan.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/exception.hpp"
@@ -197,7 +198,7 @@ string SextantIndex::ResolveSidecarPath(AttachedDatabase &db, const string &path
 	return (std::filesystem::path(db_path).parent_path() / path).lexically_normal().string();
 }
 
-void SextantIndex::AttachAndVerify() {
+void SextantIndex::AttachAndVerify(uint64_t leaf_cache_bytes, uint64_t plane_cache_bytes) {
 	// Open the sidecar read-only, verify its UUID against the one we
 	// recorded (stale/wrong-file detection), and CACHE the handle for the
 	// index lifetime: one open handle per index entry, shared by all DuckDB
@@ -214,7 +215,7 @@ void SextantIndex::AttachAndVerify() {
 		return;
 	}
 	char err[512] = {0};
-	void *handle = sextant_open_index(sidecar_path.c_str(), err, sizeof(err));
+	void *handle = sextant_open_index(sidecar_path.c_str(), leaf_cache_bytes, plane_cache_bytes, err, sizeof(err));
 	if (!handle) {
 		throw InvalidInputException("Sextant index '%s': cannot open sidecar '%s': %s. Drop and re-create the "
 		                            "index pointing at a valid .tree file",
@@ -831,8 +832,12 @@ unique_ptr<BoundIndex> SextantIndex::BuildFinalize(IndexBuildFinalizeInput &inpu
 		index.n_build = gstate.n_rows.load();
 	}
 
-	// Attach + verify the sidecar before the index becomes visible.
-	index.AttachAndVerify();
+	// Attach + verify the sidecar before the index becomes visible
+	// (with the session's cache budgets, if any).
+	{
+		auto [leaf_mb, plane_mb] = SextantCacheBudget(*gstate.context);
+		index.AttachAndVerify(leaf_mb, plane_mb);
+	}
 
 	// Prebuilt attach: the tree must be rowid-identical to the table. A
 	// row-count mismatch skews the delta_scan boundary (rows covered by

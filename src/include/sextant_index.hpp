@@ -38,7 +38,12 @@ public:
 
 	/// Open the sidecar read-only, verify its UUID (adopt on first attach;
 	/// hard error on mismatch) and cache the handle for the index lifetime.
-	void AttachAndVerify();
+	/// The cache budgets are read from the session's sextant_leaf_cache_mb /
+	/// sextant_plane_cache_mb settings by the callers that have a context
+	/// and bind at FIRST attach per index lifetime — later session changes
+	/// do not re-open an attached handle (documented: set before first use
+	/// after opening the database).
+	void AttachAndVerify(uint64_t leaf_cache_bytes = 0, uint64_t plane_cache_bytes = 0);
 
 	/// Release the cached engine handle (idempotent).
 	void CloseHandle();

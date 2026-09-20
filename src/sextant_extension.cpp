@@ -50,6 +50,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "Rerank the sextant shortlist by decoded distance (on = default quality "
 	                             "contract; disables the adaptive-W cut when off)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	// Engine-owned W-TinyLFU caches. Bind at FIRST attach of an index
+	// per database open — set before first use; mid-session changes do
+	// not re-open an attached handle.
+	db.config.AddExtensionOption("sextant_leaf_cache_mb",
+	                             "DRAM budget (MiB) for the engine's leaf-extent W-TinyLFU cache (0 = off, "
+	                             "mmap only). Pays off when the hot leaf set fits: repeated/hot query "
+	                             "workloads; never slower than mmap at any size. Read at first index use "
+	                             "per session.",
+	                             LogicalType::BIGINT, Value::BIGINT(0));
+	db.config.AddExtensionOption("sextant_plane_cache_mb",
+	                             "DRAM budget (MiB) for the engine's routing-plane cache (0 = off). Same "
+	                             "binding rules as sextant_leaf_cache_mb.",
+	                             LogicalType::BIGINT, Value::BIGINT(0));
 	db.config.AddExtensionOption("sextant_exhaustive",
 	                             "Probe every leaf (exact ranking; overrides probe fraction/W)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));

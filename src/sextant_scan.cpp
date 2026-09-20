@@ -134,7 +134,8 @@ static unique_ptr<GlobalTableFunctionState> SextantQueryInitGlobal(ClientContext
 	if (!handle) {
 		// Lazily-bound index was force-bound above; attach happened at
 		// create/load. If the handle is somehow gone, re-attach.
-		bind_data.index->AttachAndVerify();
+		auto [leaf_mb, plane_mb] = SextantCacheBudget(context);
+		bind_data.index->AttachAndVerify(leaf_mb, plane_mb);
 		handle = bind_data.index->GetEngineHandle();
 		if (!handle) {
 			throw InvalidInputException("sextant_query: index handle unavailable");
@@ -269,7 +270,8 @@ static unique_ptr<GlobalTableFunctionState> SextantQueryBatchInitGlobal(ClientCo
 
 	auto handle = bind_data.index->GetEngineHandle();
 	if (!handle) {
-		bind_data.index->AttachAndVerify();
+		auto [leaf_mb, plane_mb] = SextantCacheBudget(context);
+		bind_data.index->AttachAndVerify(leaf_mb, plane_mb);
 		handle = bind_data.index->GetEngineHandle();
 		if (!handle) {
 			throw InvalidInputException("sextant_query_batch: index handle unavailable");
