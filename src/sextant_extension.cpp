@@ -35,6 +35,24 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "Within-query parallel scan threads per sextant query (0/1 = serial; DuckDB "
 	                             "parallelizes across queries)",
 	                             LogicalType::BIGINT, Value::BIGINT(1));
+	// Search-tuning knobs (session SET vars). Defaults reproduce the
+	// engine/index defaults: probe budget and shortlist width 0 = index
+	// default (new trees persist probe_fraction 0.5, engine W = max(k,
+	// 1000)), rerank on (the quality contract), exhaustive off.
+	db.config.AddExtensionOption("sextant_probe_fraction",
+	                             "Corpus-fraction probe budget for sextant queries in [0, 1] (0 = index "
+	                             "default; lower trades recall for speed)",
+	                             LogicalType::DOUBLE, Value::DOUBLE(0.0));
+	db.config.AddExtensionOption("sextant_fastscan_w",
+	                             "Shortlist width for sextant queries (0 = engine default max(k, 1000))",
+	                             LogicalType::BIGINT, Value::BIGINT(0));
+	db.config.AddExtensionOption("sextant_rerank",
+	                             "Rerank the sextant shortlist by decoded distance (on = default quality "
+	                             "contract; disables the adaptive-W cut when off)",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db.config.AddExtensionOption("sextant_exhaustive",
+	                             "Probe every leaf (exact ranking; overrides probe fraction/W)",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// The engine scan pool serves the within-query fan-out; size it to the
 	// DuckDB thread budget so engine + DuckDB workers never oversubscribe.
 	sextant_scan_pool_set_threads(

@@ -8,6 +8,14 @@ namespace duckdb {
 
 struct DuckTableEntry;
 
+/// Apply the session's search-tuning SET variables (sextant_search_
+/// threads, sextant_probe_fraction, sextant_fastscan_w, sextant_rerank,
+/// sextant_exhaustive) onto a default-initialized opts struct. Shared by
+/// the top-k rewrite scan and the sextant_query() debug function so both
+/// paths always serve identical tunings. `engine_handle` supplies the
+/// index code size for the adaptive-W tau default (CLI AUTO parity).
+void ApplySextantSearchSettings(ClientContext &context, void *engine_handle, sextant_search_opts &opts);
+
 /// One engine predicate translated from the plan's pushed-down table
 /// filters (WHERE clauses). Storage is self-contained so the engine
 /// sextant_predicate view can point into it for the duration of the

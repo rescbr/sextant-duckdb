@@ -100,6 +100,50 @@ bool EvalDeltaPredicate(const SextantScanPredicate &p, bool is_null, double nume
 
 } // namespace
 
+void ApplySextantSearchSettings(ClientContext &context, void *engine_handle, sextant_search_opts &opts) {
+	Value v;
+	// Per-query within-query parallelism (default 1: DuckDB supplies
+	// cross-query parallelism via its own threads).
+	if (context.TryGetCurrentSetting("sextant_search_threads", v)) {
+		const int64_t n = v.GetValue<int64_t>();
+		if (n < 0 || n > 1024) {
+			throw InvalidInputException("sextant_search_threads must be in [0, 1024]");
+		}
+		opts.search_threads = static_cast<uint32_t>(n);
+	}
+	// Corpus-fraction probe budget; 0 keeps the index default (new trees
+	// persist 0.5 — measured ~0.99 recall@10 across corpora).
+	if (context.TryGetCurrentSetting("sextant_probe_fraction", v)) {
+		const double f = v.GetValue<double>();
+		if (f < 0.0 || f > 1.0) {
+			throw InvalidInputException("sextant_probe_fraction must be in [0, 1] (0 = index default)");
+		}
+		opts.probe_fraction = static_cast<float>(f);
+	}
+	// Shortlist width; 0 keeps the engine default (max(k, 1000)).
+	if (context.TryGetCurrentSetting("sextant_fastscan_w", v)) {
+		const int64_t w = v.GetValue<int64_t>();
+		if (w < 0 || w > std::numeric_limits<uint32_t>::max()) {
+			throw InvalidInputException("sextant_fastscan_w must be in [0, 2^32) (0 = engine default)");
+		}
+		opts.fastscan_W = static_cast<uint32_t>(w);
+	}
+	if (context.TryGetCurrentSetting("sextant_rerank", v)) {
+		opts.rerank = v.GetValue<bool>() ? 1 : 0;
+	}
+	if (context.TryGetCurrentSetting("sextant_exhaustive", v)) {
+		opts.exhaustive = v.GetValue<bool>() ? 1 : 0;
+	}
+	// Adaptive-W tau, CLI AUTO parity (code_size >= 288B -> 2.5 else 5.0):
+	// without it the shortlist is fixed at W~k and recall collapses (a
+	// clustered 2000x32 fixture scored 10/20 vs 20/20 with the wide cut).
+	// Requires rerank — skip the cut when rerank is disabled.
+	if (engine_handle && opts.rerank) {
+		const uint32_t code_size = sextant_index_code_size(engine_handle);
+		opts.adaptive_w_gap = code_size >= 288 ? 2.5f : 5.0f;
+	}
+}
+
 /// Append-only delta serving: brute-force rows past n_build (DELETE is
 /// fenced, so those row ids are dense and stable), compute squared-L2
 /// distances to the query, apply the translated predicates, and merge the
@@ -354,19 +398,11 @@ static unique_ptr<GlobalTableFunctionState> SextantIndexScanInitGlobal(ClientCon
 	}
 
 	// Same serving options as the explicit sextant_query() function:
-	// session within-query threads, adaptive-W tau at CLI AUTO parity.
+	// session tuning (threads, probe fraction, W, rerank, exhaustive)
+	// plus adaptive-W tau at CLI AUTO parity.
 	sextant_search_opts opts = sextant_default_search_opts();
 	opts.k = static_cast<uint32_t>(bind_data.k);
-	Value st;
-	if (context.TryGetCurrentSetting("sextant_search_threads", st)) {
-		const int64_t n = st.GetValue<int64_t>();
-		if (n < 0 || n > 1024) {
-			throw InvalidInputException("sextant_search_threads must be in [0, 1024]");
-		}
-		opts.search_threads = static_cast<uint32_t>(n);
-	}
-	const uint32_t code_size = sextant_index_code_size(handle);
-	opts.adaptive_w_gap = code_size >= 288 ? 2.5f : 5.0f;
+	ApplySextantSearchSettings(context, handle, opts);
 
 	result->row_ids.resize(bind_data.k);
 	vector<float> dists(bind_data.k);

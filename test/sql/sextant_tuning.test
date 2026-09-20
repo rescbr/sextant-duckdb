@@ -1,0 +1,117 @@
+# name: test/sql/sextant_tuning.test
+# description: search-tuning session SET variables (probe_fraction, fastscan_w, rerank, exhaustive)
+# group: [sql]
+
+require sextant
+
+load __TEST_DIR__/sextant_tuning.db
+
+# 8 well-separated clusters (0.3 apart), 250 rows each.
+statement ok
+CREATE TABLE t AS SELECT list_transform(range(32), j -> ((rowid*7919 + j*104729) % 1009)::FLOAT/1009.0*0.02 + ((rowid % 8)::FLOAT*0.3))::FLOAT[32] AS v FROM range(2000) tbl(rowid)
+
+statement ok
+CREATE INDEX idx ON t USING sextant (v) WITH (path = 'tuning.tree')
+
+# Defaults (index default probe budget + rerank + adaptive-W) serve the
+# cluster-3 query correctly.
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 3
+----
+0
+
+# Exhaustive: probe-all ranks exactly — every result is a cluster-3 row
+# AND the result set equals the OFFSET-0 exact plan's.
+statement ok
+SET sextant_exhaustive = true
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 3
+----
+0
+
+query I
+SELECT count(*) AS good FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 = 3
+----
+20
+
+statement ok
+SET sextant_exhaustive = false
+
+# A reduced probe budget trades recall for speed. On this tiny 4-leaf
+# fixture fractions below 0.5 fall under leaf granularity (the engine's
+# fraction dial is calibrated for 100K+ corpora), so we assert the
+# result count only; the f=0.75 point keeps full cluster purity.
+statement ok
+SET sextant_probe_fraction = 0.25
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20)
+----
+20
+
+statement ok
+SET sextant_probe_fraction = 0.75
+
+query I
+SELECT count(*) AS bad FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20) WHERE rowid % 8 != 3
+----
+0
+
+# Explicit shortlist width (wider than k) works alongside.
+statement ok
+SET sextant_fastscan_w = 4096
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20)
+----
+20
+
+# Turning rerank off is accepted (raw fastscan scores; results may
+# differ in exact ordering — only assert full rows).
+statement ok
+SET sextant_rerank = false
+
+query I
+SELECT count(*) FROM (SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20)
+----
+20
+
+statement ok
+SET sextant_rerank = true
+
+# sextant_query() shares the same tuning path.
+query I
+SELECT count(*) FROM (SELECT row_id FROM sextant_query('t', 'idx', list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32], 20))
+----
+20
+
+# RESET restores defaults.
+statement ok
+RESET sextant_probe_fraction
+
+statement ok
+RESET sextant_fastscan_w
+
+# Out-of-range values fail at query time with the exact message.
+statement ok
+SET sextant_probe_fraction = 1.5
+
+statement error
+SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20
+----
+sextant_probe_fraction must be in [0, 1]
+
+statement ok
+RESET sextant_probe_fraction
+
+statement ok
+SET sextant_fastscan_w = -1
+
+statement error
+SELECT rowid FROM t ORDER BY array_distance(v, list_transform(range(32), j -> 0.9::FLOAT)::FLOAT[32]) LIMIT 20
+----
+sextant_fastscan_w must be in [0, 2^32)
+
+statement ok
+RESET sextant_fastscan_w

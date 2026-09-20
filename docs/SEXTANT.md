@@ -46,6 +46,19 @@ Measured (CulturaX): untuned 20 GiB peak -> 5.3 GiB with the clamp;
 4.0 GiB with `threads=8`; 4.2 GiB and 1:37 wall with `build_threads=8`
 (engine CLI build of the same corpus: 1:21, 11.4 GiB).
 
+### Session settings (SET vars)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `sextant_search_threads` | 1 | Within-query parallel scan threads (0/1 = serial; DuckDB parallelizes across queries). |
+| `sextant_probe_fraction` | 0 (index default) | Corpus-fraction probe budget in [0, 1]. New trees default to 0.5 (~0.99 recall@10); lower trades recall for speed (0.25 ≈ 0.96 recall@10 on 100K+ corpora). |
+| `sextant_fastscan_w` | 0 (engine default) | Shortlist width (engine default = max(k, 1000)). |
+| `sextant_rerank` | true | Rerank the shortlist by decoded distance (the default quality contract; turning it off also drops the adaptive-W cut). |
+| `sextant_exhaustive` | false | Probe every leaf — exact ranking, overrides the probe budget and W. |
+
+Values are validated when a sextant query runs. The top-k rewrite and
+the `sextant_query()` debug function share the same tuning path.
+
 ## Querying
 
 The optimizer rewrites `ORDER BY array_distance(v, q) LIMIT k` into a
