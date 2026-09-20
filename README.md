@@ -48,7 +48,3 @@ SET sextant_plane_cache_mb = 128;   -- (not visible to DuckDB memory_limit)
 
 Full reference for all options and settings:
 [docs/SEXTANT.md](docs/SEXTANT.md).
-
-This repository started from the DuckDB extension template; template
-mechanics (submodules, CI tooling, distribution) are documented in
-[docs/NEXT_README.md](docs/NEXT_README.md).

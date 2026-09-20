@@ -1,2 +1,6 @@
 build/
 ref-duckdb-vss/
+
+# clangd cache
+.cache/
+duckdb_unittest_tempdir/
